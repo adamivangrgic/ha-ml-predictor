@@ -28,22 +28,33 @@ MQTT_PREFIX = os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant")
 # Tier 1: Entities to predict (all person.* are always included automatically)
 BINARY_SENSOR_PATTERNS = [p.strip() for p in os.getenv("BINARY_SENSOR_PATTERNS", "").split(",") if p.strip()]
 
-# Tier 2: Optional context entities for cross-sensor correlation (not predicted, rolling retention)
+# Bedroom presence patterns used for Sleep / Wake-Up inference
+BEDROOM_SENSOR_PATTERNS = [
+    p.strip()
+    for p in os.getenv("BEDROOM_SENSOR_PATTERNS", "*bedroom*,*soba*,*spavaca*,*bed*").split(",")
+    if p.strip()
+]
+
+# Tier 2: Human-triggered context entities for cross-sensor correlation (not predicted, rolling retention)
 CONTEXT_ENTITY_PATTERNS = [
     p.strip()
-    for p in os.getenv("CONTEXT_ENTITY_PATTERNS", "light.*,media_player.*,lock.*,cover.*,binary_sensor.*_door").split(",")
+    for p in os.getenv(
+        "CONTEXT_ENTITY_PATTERNS",
+        "binary_sensor.*_door,binary_sensor.*_window,binary_sensor.*_presence,binary_sensor.*_motion,lock.*,media_player.*",
+    ).split(",")
     if p.strip()
 ]
 EXCLUDE_PATTERNS = [
     p.strip()
     for p in os.getenv(
         "EXCLUDE_PATTERNS",
-        "*_battery*,*_rssi*,*_linkquality*,*_update*,*_uptime*,*_power*,*_energy*,*_voltage*,*_current*,*_temperature*,*_humidity*",
+        "*_predicted,*_battery*,*_rssi*,*_linkquality*,*_update*,*_uptime*,*_power*,*_energy*,*_voltage*,*_current*,*_temperature*,*_humidity*,climate.*,light.*,cover.*",
     ).split(",")
     if p.strip()
 ]
 
 CERTAINTY_THRESHOLD = float(os.getenv("CERTAINTY_THRESHOLD", "0.70"))
+MIN_ACCEPTABLE_ACCURACY = float(os.getenv("MIN_ACCEPTABLE_ACCURACY", "0.70"))
 PREDICT_HORIZON_MINS = int(os.getenv("PREDICT_HORIZON_MINS", "30"))
 RESAMPLE_MINS = int(os.getenv("RESAMPLE_MINS", "5"))
 VELOCITY_LOOKBACK_MINS = int(os.getenv("VELOCITY_LOOKBACK_MINS", "15"))
@@ -106,7 +117,7 @@ def init_db():
             PRIMARY KEY (entity_id, timestamp)
         )
     """)
-    # Tier 2: Rolling short-term archive for context entities (pruned automatically)
+    # Tier 2: Rolling short-term archive for context entities
     conn.execute("""
         CREATE TABLE IF NOT EXISTS context_history (
             entity_id TEXT,
@@ -115,8 +126,22 @@ def init_db():
             PRIMARY KEY (entity_id, timestamp)
         )
     """)
+    # Self-scoring prediction audit log
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prediction_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id TEXT,
+            predicted_at TEXT,
+            target_ts TEXT,
+            predicted_state TEXT,
+            certainty REAL,
+            actual_state TEXT,
+            is_correct INTEGER
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_state_hist_eid ON state_history(entity_id, timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ctx_hist_eid ON context_history(entity_id, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_eid_target ON prediction_audit(entity_id, target_ts)")
     conn.commit()
     return conn
 
@@ -127,12 +152,15 @@ def get_last_timestamp(conn, table, entity_id):
     return row[0] if row and row[0] else None
 
 
-def prune_context_history(conn):
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
-    cur = conn.execute("DELETE FROM context_history WHERE timestamp < ?", (cutoff,))
+def prune_old_records(conn):
+    ctx_cutoff = (datetime.now(timezone.utc) - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
+    c1 = conn.execute("DELETE FROM context_history WHERE timestamp < ?", (ctx_cutoff,))
+
+    audit_cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    c2 = conn.execute("DELETE FROM prediction_audit WHERE predicted_at < ?", (audit_cutoff,))
     conn.commit()
-    if cur.rowcount > 0:
-        log.info(f"Pruned {cur.rowcount} expired context_history rows older than {CONTEXT_RETENTION_DAYS} days.")
+    if c1.rowcount > 0 or c2.rowcount > 0:
+        log.info(f"Pruned {c1.rowcount} context rows and {c2.rowcount} old audit rows.")
 
 
 def archive_states(conn, states_list, is_context=False):
@@ -166,6 +194,66 @@ def archive_states(conn, states_list, is_context=False):
                 log.error(f"DB Insert error: {e}")
     conn.commit()
     return inserted
+
+
+# --- Self-Scoring Accuracy & Auto-Calibration ---
+def log_and_score_predictions(conn, entity_id, predicted_state, certainty, live_state, now_dt):
+    """
+    1. Grades any past predictions whose target_ts has now elapsed.
+    2. Logs the current prediction for future grading.
+    3. Computes 7-day accuracy and auto-calibrates the certainty threshold if accuracy degrades.
+    """
+    now_iso = now_dt.isoformat()
+    is_person = entity_id.startswith("person.")
+    norm_live = ("home" if live_state == "home" else "not_home") if is_person else live_state
+
+    # Grade matured predictions
+    cur = conn.execute(
+        "SELECT id, predicted_state FROM prediction_audit WHERE entity_id = ? AND actual_state IS NULL AND target_ts <= ?",
+        (entity_id, now_iso),
+    )
+    ungraded = cur.fetchall()
+    for row_id, pred_st in ungraded:
+        if pred_st == "unknown":
+            # 'unknown' abstentions are marked evaluated without counting as right or wrong
+            conn.execute(
+                "UPDATE prediction_audit SET actual_state = ?, is_correct = NULL WHERE id = ?",
+                (norm_live, row_id),
+            )
+        else:
+            correct = 1 if pred_st == norm_live else 0
+            conn.execute(
+                "UPDATE prediction_audit SET actual_state = ?, is_correct = ? WHERE id = ?",
+                (norm_live, correct, row_id),
+            )
+
+    # Record current prediction for evaluation after PREDICT_HORIZON_MINS
+    target_iso = (now_dt + timedelta(minutes=PREDICT_HORIZON_MINS)).isoformat()
+    conn.execute(
+        "INSERT INTO prediction_audit (entity_id, predicted_at, target_ts, predicted_state, certainty) VALUES (?, ?, ?, ?, ?)",
+        (entity_id, now_iso, target_iso, predicted_state, float(certainty)),
+    )
+    conn.commit()
+
+    # Calculate 7-day accuracy over non-unknown predictions
+    cutoff_7d = (now_dt - timedelta(days=7)).isoformat()
+    stats = conn.execute(
+        "SELECT COUNT(*), SUM(is_correct) FROM prediction_audit WHERE entity_id = ? AND predicted_at >= ? AND is_correct IS NOT NULL",
+        (entity_id, cutoff_7d),
+    ).fetchone()
+
+    total_graded = stats[0] or 0
+    total_correct = stats[1] or 0
+    accuracy_7d = round(total_correct / total_graded, 3) if total_graded > 0 else None
+
+    # Auto-calibrate threshold: if accuracy over >= 20 predictions falls below MIN_ACCEPTABLE_ACCURACY,
+    # tighten the required certainty so noisy sensors abstain ('unknown') more often.
+    effective_threshold = CERTAINTY_THRESHOLD
+    if total_graded >= 20 and accuracy_7d is not None and accuracy_7d < MIN_ACCEPTABLE_ACCURACY:
+        deficit = MIN_ACCEPTABLE_ACCURACY - accuracy_7d
+        effective_threshold = min(0.92, round(CERTAINTY_THRESHOLD + deficit * 0.75, 2))
+
+    return accuracy_7d, total_graded, effective_threshold
 
 
 # --- Home Assistant API ---
@@ -207,7 +295,6 @@ def get_entities():
         if eid in target_ids or is_excluded(eid):
             continue
         if any(fnmatch.fnmatch(eid, pat) for pat in CONTEXT_ENTITY_PATTERNS):
-            # Only include context entities with discrete/actionable states
             st = str(item.get("state", "")).lower()
             if st in ACTIVE_STATES or st in INACTIVE_STATES:
                 context_entities.append(item)
@@ -262,568 +349,86 @@ def sync_entity_group(conn, entities, is_context=False):
     conn.commit()
 
 
-# --- Nightly Cross-Sensor Lagged Correlation Engine ---
-def run_correlation_analysis(conn, all_entity_map):
+# --- Sleep, Wake-Up & Bedtime Inference ---
+def infer_sleep_schedule(conn, targets):
     """
-    Finds significant simultaneous and lead/lag relationships across all Tier 1 and Tier 2 entities.
-    Returns:
-      - driver_map: {target_eid: [{"driver_eid": str, "lag_mins": int, "corr": float, "summary": str}, ...]}
-      - top_insights: [str, ...] human-readable household behavioral rules
+    Infers typical bedtime and wake-up time from bedroom presence sensors (weekday vs weekend)
+    and projects the next expected wake-up and bedtime timestamps.
     """
-    log.info("Running cross-sensor lagged correlation analysis...")
-    now_dt = datetime.now(timezone.utc)
-    cutoff_str = (now_dt - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
-
-    df_t1 = pd.read_sql_query(
-        "SELECT entity_id, timestamp, state FROM state_history WHERE timestamp >= ?",
-        conn,
-        params=(cutoff_str,),
-    )
-    df_t2 = pd.read_sql_query(
-        "SELECT entity_id, timestamp, state FROM context_history WHERE timestamp >= ?",
-        conn,
-        params=(cutoff_str,),
-    )
-    df_all = pd.concat([df_t1, df_t2], ignore_index=True)
-
-    if df_all.empty:
-        return {}, []
-
-    df_all["timestamp"] = pd.to_datetime(df_all["timestamp"], format="ISO8601", utc=True)
-    resample_rule = f"{RESAMPLE_MINS}min"
-
-    # Build aligned binary matrix (rows = time intervals, cols = entity_ids)
-    series_dict = {}
-    for eid, grp in df_all.groupby("entity_id"):
-        grp = grp.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-        is_p = eid.startswith("person.")
-        s = grp.set_index("timestamp")["state"].apply(lambda x: state_to_binary(x, is_person=is_p))
-        # Extend timeline to now and resample
-        s.loc[now_dt] = s.iloc[-1]
-        s_res = s.resample(resample_rule).ffill().dropna()
-        if s_res.nunique() >= 2 and len(s_res) >= 48:
-            series_dict[eid] = s_res
-
-    if len(series_dict) < 2:
-        log.info("Not enough active entities with state transitions for correlation analysis yet.")
-        return {}, []
-
-    grid = pd.DataFrame(series_dict).ffill().bfill().dropna()
-    if len(grid) < 48:
-        return {}, []
-
-    target_eids = [eid for eid in grid.columns if eid.startswith("person.") or any(
-        fnmatch.fnmatch(eid, pat) for pat in BINARY_SENSOR_PATTERNS
-    )]
-
-    # Test simultaneous (0m) and driver-leads-target lags (5m, 10m, 15m)
-    lags_mins = [0, 5, 10, 15]
-    driver_map = {}
-    all_findings = []
-
-    def friendly(eid):
-        return all_entity_map.get(eid, {}).get("attributes", {}).get("friendly_name", eid)
-
-    for target in target_eids:
-        target_series = grid[target]
-        candidates = []
-
-        for driver in grid.columns:
-            if driver == target:
-                continue
-
-            best_lag = 0
-            best_corr = 0.0
-
-            for lag_m in lags_mins:
-                shift_steps = lag_m // RESAMPLE_MINS
-                shifted_driver = grid[driver].shift(shift_steps) if shift_steps > 0 else grid[driver]
-                valid = pd.concat([target_series, shifted_driver], axis=1).dropna()
-                if len(valid) < 48 or valid.iloc[:, 1].nunique() < 2:
-                    continue
-                r = float(valid.iloc[:, 0].corr(valid.iloc[:, 1]))
-                if not math.isnan(r) and abs(r) > abs(best_corr):
-                    best_corr = r
-                    best_lag = lag_m
-
-            if abs(best_corr) >= CORRELATION_MIN_STRENGTH:
-                d_name = friendly(driver)
-                t_name = friendly(target)
-                d_is_person = driver.startswith("person.")
-                t_is_person = target.startswith("person.")
-
-                if best_corr > 0:
-                    d_action = "arrives home" if d_is_person else "activates"
-                    t_action = "arrives home" if t_is_person else "activates"
-                else:
-                    d_action = "leaves home" if d_is_person else "turns off"
-                    t_action = "arrives home" if t_is_person else "activates"
-
-                if best_lag == 0:
-                    timing = "at the same time"
-                else:
-                    timing = f"~{best_lag}m before {t_name} {t_action}"
-
-                summary = f"{d_name} {d_action} {timing} (r={best_corr:+.2f})"
-                candidates.append({
-                    "driver_eid": driver,
-                    "lag_mins": best_lag,
-                    "corr": round(best_corr, 3),
-                    "summary": summary,
-                })
-                all_findings.append((abs(best_corr), f"When {d_name} {d_action}, {t_name} {t_action} {timing if best_lag > 0 else 'simultaneously'} (r={best_corr:+.2f})"))
-
-        # Keep top 3 strongest drivers per target
-        candidates.sort(key=lambda x: abs(x["corr"]), reverse=True)
-        driver_map[target] = candidates[:3]
-
-    # Deduplicate and sort global household insights
-    all_findings.sort(key=lambda x: x[0], reverse=True)
-    seen = set()
-    top_insights = []
-    for _, text in all_findings:
-        if text not in seen:
-            seen.add(text)
-            top_insights.append(text)
-        if len(top_insights) >= 15:
-            break
-
-    log.info(f"Correlation analysis complete: found {len(top_insights)} strong behavioral rules across {len(grid.columns)} entities.")
-    return driver_map, top_insights
-
-
-def get_driver_history_series(conn, driver_eid, lag_mins, resample_rule, index_like):
-    """Fetches a resampled, lag-shifted binary series for a correlated driver entity."""
-    table = "state_history" if (
-        driver_eid.startswith("person.") or any(fnmatch.fnmatch(driver_eid, pat) for pat in BINARY_SENSOR_PATTERNS)
-    ) else "context_history"
-
-    df_d = pd.read_sql_query(
-        f"SELECT timestamp, state FROM {table} WHERE entity_id = ? ORDER BY timestamp ASC",
-        conn,
-        params=(driver_eid,),
-    )
-    if df_d.empty:
-        return pd.Series(0, index=index_like)
-
-    df_d["timestamp"] = pd.to_datetime(df_d["timestamp"], format="ISO8601", utc=True)
-    df_d = df_d.drop_duplicates(subset=["timestamp"], keep="last")
-    is_p = driver_eid.startswith("person.")
-    s = df_d.set_index("timestamp")["state"].apply(lambda x: state_to_binary(x, is_person=is_p))
-    s.loc[index_like.max()] = s.iloc[-1]
-    s_res = s.resample(resample_rule).ffill()
-
-    shift_steps = lag_mins // RESAMPLE_MINS
-    if shift_steps > 0:
-        s_res = s_res.shift(shift_steps)
-
-    return s_res.reindex(index_like, method="ffill").fillna(0).astype(int)
-
-
-# --- Feature Engineering & ML ---
-def build_features(df, is_person=False, driver_cols=None):
-    df = df.copy()
-    df["hour"] = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
-    df["dow"] = df["timestamp"].dt.day_of_week
-    df["is_weekend"] = (df["dow"] >= 5).astype(int)
-
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
-    df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
-    df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
-
-    schedule_cols = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend"]
-    feature_cols = schedule_cols + ["current_state_bin", "mins_in_current_state"]
-
-    if is_person:
-        def calc_dist(a):
-            return haversine_km(a.get("latitude"), a.get("longitude"), HOME_COORDS[0], HOME_COORDS[1])
-
-        df["distance_from_home_km"] = df["attr_dict"].apply(calc_dist)
-        df["gps_accuracy"] = df["attr_dict"].apply(lambda a: float(a.get("gps_accuracy", 0) or 0))
-
-        if "home_approach_speed_kmh" not in df.columns:
-            lookback_steps = max(1, VELOCITY_LOOKBACK_MINS // RESAMPLE_MINS)
-            lookback_hours = (lookback_steps * RESAMPLE_MINS) / 60.0
-            prev_dist = df["distance_from_home_km"].shift(lookback_steps).fillna(df["distance_from_home_km"])
-            speed = (prev_dist - df["distance_from_home_km"]) / lookback_hours
-            speed = speed.where(speed.abs() >= 1.5, 0.0).clip(-250.0, 250.0)
-            df["home_approach_speed_kmh"] = speed
-
-        if "eta_mins" not in df.columns:
-            df["eta_mins"] = [
-                compute_eta_mins(d, s, bool(st == 1))
-                for d, s, st in zip(
-                    df["distance_from_home_km"],
-                    df["home_approach_speed_kmh"],
-                    df["current_state_bin"],
-                )
-            ]
-
-        feature_cols.extend([
-            "distance_from_home_km",
-            "gps_accuracy",
-            "home_approach_speed_kmh",
-            "eta_mins",
-        ])
-
-    if driver_cols:
-        feature_cols.extend(driver_cols)
-
-    return df, feature_cols, schedule_cols
-
-
-def build_24h_ascii_timeline(schedule_model, now_dt, threshold):
-    """Generates a 48-char (30-min/char) high-contrast ASCII timeline for the next 24 hours."""
-    slot_offsets = np.arange(48) * 30 + 15
-    slot_timestamps = pd.to_datetime([now_dt + timedelta(minutes=int(m)) for m in slot_offsets], utc=True)
-    hours = slot_timestamps.hour + slot_timestamps.minute / 60.0
-    dows = slot_timestamps.day_of_week
-
-    X_slots = pd.DataFrame({
-        "hour_sin": np.sin(2 * np.pi * hours / 24.0),
-        "hour_cos": np.cos(2 * np.pi * hours / 24.0),
-        "dow_sin": np.sin(2 * np.pi * dows / 7.0),
-        "dow_cos": np.cos(2 * np.pi * dows / 7.0),
-        "is_weekend": (dows >= 5).astype(int),
-    })
-
-    probs = schedule_model.predict_proba(X_slots)
-    classes = list(schedule_model.classes_)
-    prob_pos = probs[:, classes.index(1)] if 1 in classes else np.zeros(48)
-
-    chars = []
-    for i, p in enumerate(prob_pos):
-        if i > 0 and i % 12 == 0:
-            chars.append("|")
-        chars.append("█" if p >= threshold else "·")
-
-    return "".join(chars)
-
-
-def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
-    """Vectorized 7-day scan using pure schedule features + 24h ASCII timeline builder."""
-    next_on = None
-    next_off = None
-
-    total_steps = (7 * 24 * 60) // RESAMPLE_MINS
-    steps = np.arange(1, total_steps + 1)
-    fut_timestamps = pd.to_datetime([now_dt + timedelta(minutes=RESAMPLE_MINS * int(s)) for s in steps], utc=True)
-    hours = fut_timestamps.hour + fut_timestamps.minute / 60.0
-    dows = fut_timestamps.day_of_week
-
-    X_fut = pd.DataFrame({
-        "hour_sin": np.sin(2 * np.pi * hours / 24.0),
-        "hour_cos": np.cos(2 * np.pi * hours / 24.0),
-        "dow_sin": np.sin(2 * np.pi * dows / 7.0),
-        "dow_cos": np.cos(2 * np.pi * dows / 7.0),
-        "is_weekend": (dows >= 5).astype(int),
-    })
-
-    probs = schedule_model.predict_proba(X_fut)
-    classes = list(schedule_model.classes_)
-    prob_pos = probs[:, classes.index(1)] if 1 in classes else np.zeros(len(steps))
-
-    threshold = 0.50 if prob_pos.max() >= 0.50 else max(0.25, float(prob_pos.max()) * 0.85)
-    preds = (prob_pos >= threshold).astype(int)
-
-    sim_state = current_state_bin
-    for idx, pred in enumerate(preds):
-        if sim_state == 0 and pred == 1 and next_on is None:
-            next_on = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
-        elif sim_state == 1 and pred == 0 and next_off is None:
-            next_off = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
-
-        sim_state = pred
-        if next_on and next_off:
-            break
-
-    timeline_24h = build_24h_ascii_timeline(schedule_model, now_dt, threshold)
-    return next_on, next_off, timeline_24h
-
-
-def train_and_predict(conn, entity_item, drivers, all_entity_map):
-    eid = entity_item["entity_id"]
-    is_person = eid.startswith("person.")
-    positive_state = "home" if is_person else "on"
-    negative_state = "not_home" if is_person else "off"
-    now_dt = datetime.now(timezone.utc)
-
-    df = pd.read_sql_query(
-        "SELECT timestamp, state, attributes FROM state_history WHERE entity_id = ? ORDER BY timestamp ASC",
-        conn,
-        params=(eid,),
-    )
-
-    if df.empty:
-        return "unknown", 0.0, {"reason": "no_history_recorded"}
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
-
-    span_hours = (now_dt - df["timestamp"].min()).total_seconds() / 3600.0
-    if span_hours < MIN_HISTORY_HOURS:
-        return "unknown", 0.0, {
-            "reason": "insufficient_time_span",
-            "recorded_hours": round(span_hours, 1),
-            "required_hours": MIN_HISTORY_HOURS,
-        }
-
-    now_anchor = pd.DataFrame([{
-        "timestamp": now_dt,
-        "state": entity_item.get("state"),
-        "attributes": json.dumps(entity_item.get("attributes", {})),
-    }])
-    df = pd.concat([df, now_anchor], ignore_index=True)
-
-    df["state_change_group"] = (df["state"] != df["state"].shift()).cumsum()
-    df["group_start_ts"] = df.groupby("state_change_group")["timestamp"].transform("first")
-
-    resample_rule = f"{RESAMPLE_MINS}min"
-    df_indexed = df.set_index("timestamp").resample(resample_rule).ffill().dropna(subset=["state"])
-
-    # Attach correlated driver history columns onto the same resampled time index
-    driver_cols = []
-    live_driver_vals = {}
-    for idx_d, drv in enumerate(drivers):
-        col_name = f"driver_{idx_d}"
-        d_eid = drv["driver_eid"]
-        d_lag = drv["lag_mins"]
-        s_drv = get_driver_history_series(conn, d_eid, d_lag, resample_rule, df_indexed.index)
-        df_indexed[col_name] = s_drv.values
-        driver_cols.append(col_name)
-
-        # Live driver state (at t - lag_mins, or current state if lag == 0)
-        if d_lag == 0 and d_eid in all_entity_map:
-            live_st = all_entity_map[d_eid].get("state")
-            live_driver_vals[col_name] = state_to_binary(live_st, is_person=d_eid.startswith("person."))
-        else:
-            live_driver_vals[col_name] = int(s_drv.iloc[-1]) if len(s_drv) > 0 else 0
-
-    df = df_indexed.reset_index()
-    df["attr_dict"] = df["attributes"].apply(json.loads)
-    df["current_state_bin"] = (df["state"] == positive_state).astype(int)
-    df["mins_in_current_state"] = (df["timestamp"] - df["group_start_ts"]).dt.total_seconds() / 60.0
-
-    shift_steps = max(1, PREDICT_HORIZON_MINS // RESAMPLE_MINS)
-    df["future_target"] = df["current_state_bin"].shift(-shift_steps)
-    train_df = df.dropna(subset=["future_target"]).copy()
-
-    if train_df["future_target"].nunique() < 2:
-        const_val = int(train_df["future_target"].iloc[0])
-        const_state = positive_state if const_val == 1 else negative_state
-        glyph = "█" if const_val == 1 else "·"
-        flat_line = "|".join([glyph * 12] * 4)
-        return const_state, 1.0, {
-            "reason": "constant_historical_state",
-            "expected_next_on": None,
-            "expected_next_off": None,
-            "timeline_24h": flat_line,
-            "timeline_start": now_dt.astimezone(LOCAL_TZ).strftime("%H:%M"),
-            "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
-            "correlated_triggers": [d["summary"] for d in drivers],
-            "recorded_hours": round(span_hours, 1),
-        }
-
-    train_df, feature_cols, schedule_cols = build_features(train_df, is_person=is_person, driver_cols=driver_cols)
-    X = train_df[feature_cols]
-    y = train_df["future_target"].astype(int)
-
-    age_days = (now_dt - train_df["timestamp"]).dt.total_seconds() / 86400.0
-    sample_weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
-
-    # 1. Context-aware model (includes live distance, velocity, ETA, correlated drivers + time)
-    model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
-    model.fit(X, y, sample_weight=sample_weights)
-
-    # 2. Pure schedule model for next_on / next_off & 24h timeline forecasting
-    schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-    schedule_model.fit(train_df[schedule_cols], y, sample_weight=sample_weights)
-
-    last_changed_str = entity_item.get("last_changed")
-    last_changed_dt = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00")) if last_changed_str else now_dt
-    mins_in_state = max(0.0, (now_dt - last_changed_dt).total_seconds() / 60.0)
-    curr_bin = 1 if entity_item.get("state") == positive_state else 0
-    curr_attrs = entity_item.get("attributes", {})
-
-    live_row = {
-        "timestamp": now_dt,
-        "attr_dict": curr_attrs,
-        "current_state_bin": curr_bin,
-        "mins_in_current_state": mins_in_state,
-        **live_driver_vals,
-    }
-
-    if is_person:
-        curr_dist = haversine_km(curr_attrs.get("latitude"), curr_attrs.get("longitude"), HOME_COORDS[0], HOME_COORDS[1])
-        lookback_steps = max(1, VELOCITY_LOOKBACK_MINS // RESAMPLE_MINS)
-        if len(df) > lookback_steps:
-            past_attrs = df["attr_dict"].iloc[-(lookback_steps + 1)]
-            past_dist = haversine_km(past_attrs.get("latitude"), past_attrs.get("longitude"), HOME_COORDS[0], HOME_COORDS[1])
-            lookback_hours = (lookback_steps * RESAMPLE_MINS) / 60.0
-            raw_speed = (past_dist - curr_dist) / lookback_hours
-            approach_speed = 0.0 if abs(raw_speed) < 1.5 else max(-250.0, min(250.0, raw_speed))
-        else:
-            approach_speed = 0.0
-
-        live_row["home_approach_speed_kmh"] = approach_speed
-        live_row["eta_mins"] = compute_eta_mins(curr_dist, approach_speed, bool(curr_bin == 1))
-
-    now_df = pd.DataFrame([live_row])
-    now_df, _, _ = build_features(now_df, is_person=is_person, driver_cols=driver_cols)
-
-    probs = model.predict_proba(now_df[feature_cols])[0]
-    classes = list(model.classes_)
-    prob_pos = probs[classes.index(1)] if 1 in classes else 0.0
-    prob_neg = probs[classes.index(0)] if 0 in classes else 0.0
-
-    max_prob = max(prob_pos, prob_neg)
-    predicted_state = positive_state if prob_pos >= prob_neg else negative_state
-
-    next_on, next_off, timeline_24h = estimate_next_transitions(schedule_model, now_dt, curr_bin)
-
-    meta = {
-        "probability_active": round(float(prob_pos), 3),
-        "certainty": round(float(max_prob), 3),
-        "threshold": CERTAINTY_THRESHOLD,
-        "horizon_mins": PREDICT_HORIZON_MINS,
-        "expected_next_on": next_on,
-        "expected_next_off": next_off,
-        "timeline_24h": timeline_24h,
-        "timeline_start": now_dt.astimezone(LOCAL_TZ).strftime("%H:%M"),
-        "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
-        "correlated_triggers": [d["summary"] for d in drivers],
-        "mins_in_current_state": round(mins_in_state, 1),
-        "recorded_hours": round(span_hours, 1),
-        "last_updated": now_dt.astimezone(LOCAL_TZ).isoformat(),
-    }
-
-    if is_person:
-        meta["distance_from_home_km"] = round(float(now_df["distance_from_home_km"].iloc[0]), 2)
-        meta["home_approach_speed_kmh"] = round(float(now_df["home_approach_speed_kmh"].iloc[0]), 1)
-        meta["eta_mins"] = round(float(now_df["eta_mins"].iloc[0]), 0)
-
-    if max_prob < CERTAINTY_THRESHOLD:
-        return "unknown", max_prob, meta
-
-    return predicted_state, max_prob, meta
-
-
-# --- MQTT Home Assistant Auto-Discovery ---
-def setup_mqtt():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    if MQTT_USER:
-        client.username_pw_set(MQTT_USER, MQTT_PASS)
-    client.connect(MQTT_HOST, MQTT_PORT, 60)
-    client.loop_start()
-    return client
-
-
-def publish_ha_discovery(client, entity_item, state, attributes):
-    eid = entity_item["entity_id"]
-    object_slug = eid.split(".", 1)[1]
-    friendly_name = entity_item.get("attributes", {}).get("friendly_name", object_slug.replace("_", " ").title())
-
-    default_entity_id = f"sensor.{object_slug}_predicted"
-    unique_id = f"{object_slug}_predicted"
-
-    base_topic = f"{MQTT_PREFIX}/sensor/{unique_id}"
-    config_topic = f"{base_topic}/config"
-    state_topic = f"{base_topic}/state"
-    attr_topic = f"{base_topic}/attributes"
-
-    discovery_payload = {
-        "name": f"{friendly_name} Predicted",
-        "default_entity_id": default_entity_id,
-        "unique_id": unique_id,
-        "state_topic": state_topic,
-        "json_attributes_topic": attr_topic,
-        "icon": "mdi:account-clock" if eid.startswith("person.") else "mdi:motion-sensor",
-        "device": {
-            "identifiers": ["ha_ml_predictor_service"],
-            "name": "HA ML Predictor",
-            "manufacturer": "Custom ML Service",
-            "model": "RandomForest State Forecaster",
-        },
-    }
-
-    client.publish(config_topic, json.dumps(discovery_payload), retain=True)
-    client.publish(state_topic, state, retain=True)
-    client.publish(attr_topic, json.dumps(attributes), retain=True)
-
-
-def publish_insights_sensor(client, insights, context_count):
-    unique_id = "ha_ml_behavioral_insights"
-    base_topic = f"{MQTT_PREFIX}/sensor/{unique_id}"
-    discovery_payload = {
-        "name": "HA ML Behavioral Insights",
-        "default_entity_id": "sensor.ha_ml_behavioral_insights",
-        "unique_id": unique_id,
-        "state_topic": f"{base_topic}/state",
-        "json_attributes_topic": f"{base_topic}/attributes",
-        "icon": "mdi:brain",
-        "device": {
-            "identifiers": ["ha_ml_predictor_service"],
-            "name": "HA ML Predictor",
-            "manufacturer": "Custom ML Service",
-            "model": "RandomForest State Forecaster",
-        },
-    }
-    attrs = {
-        "insights": insights,
-        "context_entities_monitored": context_count,
-        "min_correlation_threshold": CORRELATION_MIN_STRENGTH,
-        "last_analyzed": datetime.now(timezone.utc).astimezone(LOCAL_TZ).isoformat(),
-    }
-    client.publish(f"{base_topic}/config", json.dumps(discovery_payload), retain=True)
-    client.publish(f"{base_topic}/state", str(len(insights)), retain=True)
-    client.publish(f"{base_topic}/attributes", json.dumps(attrs), retain=True)
-
-
-# --- Main Loop ---
-def main():
-    if not HA_TOKEN:
-        raise ValueError("HA_TOKEN environment variable is required.")
-
-    conn = init_db()
-    mqtt_client = setup_mqtt()
-    fetch_home_coords()
-    log.info("HA ML Predictor started.")
-
-    last_corr_run = None
-    driver_map = {}
-    top_insights = []
-
-    while True:
-        try:
-            targets, context_entities = get_entities()
-            all_entity_map = {e["entity_id"]: e for e in (targets + context_entities)}
-
-            sync_entity_group(conn, targets, is_context=False)
-            sync_entity_group(conn, context_entities, is_context=True)
-
-            # Run correlation discovery at startup and every CORRELATION_INTERVAL_HOURS
-            now_utc = datetime.now(timezone.utc)
-            if last_corr_run is None or (now_utc - last_corr_run).total_seconds() >= CORRELATION_INTERVAL_HOURS * 3600:
-                prune_context_history(conn)
-                driver_map, top_insights = run_correlation_analysis(conn, all_entity_map)
-                publish_insights_sensor(mqtt_client, top_insights, len(context_entities))
-                last_corr_run = now_utc
-
-            for item in targets:
-                eid = item["entity_id"]
-                drivers = driver_map.get(eid, [])
-                pred_state, cert, meta = train_and_predict(conn, item, drivers, all_entity_map)
-                publish_ha_discovery(mqtt_client, item, pred_state, meta)
-                log.info(
-                    f"{eid} -> {pred_state} "
-                    f"(cert: {cert:.2f}, drivers: {len(drivers)}, 24h: {meta.get('timeline_24h')})"
-                )
-
-        except Exception as e:
-            log.error(f"Error in main loop: {e}", exc_info=True)
-
-        time.sleep(300)
-
-
-if __name__ == "__main__":
-    main()
+    bedroom_eids = [
+        t["entity_id"]
+        for t in targets
+        if t["entity_id"].startswith("binary_sensor.")
+        and any(fnmatch.fnmatch(t["entity_id"], pat) for pat in BEDROOM_SENSOR_PATTERNS)
+    ]
+
+    if not bedroom_eids:
+        return None
+
+    # Use the primary bedroom sensor with the most recorded history
+    best_eid = None
+    best_df = pd.DataFrame()
+    for eid in bedroom_eids:
+        df = pd.read_sql_query(
+            "SELECT timestamp, state FROM state_history WHERE entity_id = ? ORDER BY timestamp ASC",
+            conn,
+            params=(eid,),
+        )
+        if len(df) > len(best_df):
+            best_df = df
+            best_eid = eid
+
+    if best_df.empty or len(best_df) < 4:
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(LOCAL_TZ)
+
+    best_df["timestamp"] = pd.to_datetime(best_df["timestamp"], format="ISO8601", utc=True)
+    best_df = best_df.drop_duplicates(subset=["timestamp"], keep="last")
+    best_df["is_on"] = best_df["state"].apply(lambda s: 1 if str(s).lower() == "on" else 0)
+
+    # Resample to 10-minute blocks and bridge brief <20m midnight bathroom breaks
+    s = best_df.set_index("timestamp")["is_on"]
+    s.loc[now_utc] = s.iloc[-1]
+    s_10m = s.resample("10min").ffill().fillna(0)
+
+    # Smooth out brief 1-2 block (10-20m) gaps inside a long sleep stretch
+    s_smooth = s_10m.rolling(window=3, min_periods=1, center=True).max().astype(int)
+
+    # Group contiguous 'on' blocks
+    groups = (s_smooth != s_smooth.shift()).cumsum()
+    sessions = []
+    for _, grp in s_smooth.groupby(groups):
+        if grp.iloc[0] != 1:
+            continue
+        start_local = grp.index.min().tz_convert(LOCAL_TZ)
+        end_local = grp.index.max().tz_convert(LOCAL_TZ)
+        duration_hrs = (end_local - start_local).total_seconds() / 3600.0
+
+        # Valid overnight sleep session: >= 3.5 hours, starting between 19:00 and 05:00
+        if duration_hrs >= 3.5 and (start_local.hour >= 19 or start_local.hour <= 5):
+            # Ignore an ongoing session still active right now when measuring wake-up time
+            is_ongoing = (now_local - end_local).total_seconds() < 900
+            bed_hour = start_local.hour + start_local.minute / 60.0
+            if bed_hour < 12:
+                bed_hour += 24.0  # Represent 01:30 AM as 25.5 for clean averaging
+            wake_hour = end_local.hour + end_local.minute / 60.0
+            is_weekend_wake = end_local.weekday() >= 5
+            sessions.append({
+                "bed_hour": bed_hour,
+                "wake_hour": wake_hour if not is_ongoing else None,
+                "duration_hrs": duration_hrs if not is_ongoing else None,
+                "is_weekend": is_weekend_wake,
+            })
+
+    if not sessions:
+        return None
+
+    sess_df = pd.DataFrame(sessions)
+    completed = sess_df.dropna(subset=["wake_hour"])
+    if completed.empty:
+        return None
+
+    overall_wake = float(completed["wake_hour"].median())
+    wk
