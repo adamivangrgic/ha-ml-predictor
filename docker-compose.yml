@@ -20,3 +20,9 @@ services:
       - PREDICT_HORIZON_MINS=30
       # Days of history to pull from HA on first boot before relying on local SQLite archive
       - INITIAL_HISTORY_DAYS=10
+      # Optional Tier-2 context domains for cross-sensor correlation (not turned into *_predicted sensors)
+      - CONTEXT_ENTITY_PATTERNS=light.*,media_player.*,lock.*,cover.*,binary_sensor.*_door
+      # Rolling retention window for Tier-2 context history
+      - CONTEXT_RETENTION_DAYS=14
+      # Minimum correlation coefficient (0.0 to 1.0) required to link two sensors
+      - CORRELATION_MIN_STRENGTH=0.35
