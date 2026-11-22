@@ -1,6 +1,5 @@
 services:
   ha-ml-predictor:
-    build: .
     container_name: ha-ml-predictor
     restart: unless-stopped
     volumes:
