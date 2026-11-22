@@ -191,7 +191,7 @@ def archive_states(conn, states_list, is_context=False):
     return inserted
 
 
-# --- Self-Evaluating Accuracy Tracking (#5) ---
+# --- Self-Evaluating Accuracy Tracking ---
 def evaluate_past_predictions(conn):
     """Grades matured predictions against archived state_history and returns 7d accuracy stats per entity."""
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -201,7 +201,6 @@ def evaluate_past_predictions(conn):
     ).fetchall()
 
     for row_id, eid, target_ts, pred_state in pending:
-        # Find the active state at target_ts (latest transition at or before target_ts)
         cur = conn.execute(
             "SELECT state FROM state_history WHERE entity_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
             (eid, target_ts),
@@ -714,7 +713,7 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
     resample_rule = f"{RESAMPLE_MINS}min"
     df_indexed = df.set_index("timestamp").resample(resample_rule).ffill().dropna(subset=["state"])
 
-    # Attach workday/holiday flag series (#3)
+    # Attach workday/holiday flag series
     s_workday = get_workday_series(conn, resample_rule, df_indexed.index, workday_item)
     df_indexed["is_workday"] = s_workday.values
 
@@ -806,11 +805,11 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
     now_df = pd.DataFrame([live_row])
     now_df, _, _ = build_features(now_df, is_person=is_person, driver_cols=driver_cols)
 
-    # --- Train Multi-Horizon Models (#2) ---
+    # --- Train Multi-Horizon Models ---
     all_horizons = sorted(set([PREDICT_HORIZON_MINS] + EXTRA_HORIZONS_MINS))
     horizon_probs = {}
-    primary_model = None
     primary_train_df = None
+    primary_y = None
     primary_weights = None
 
     for h_mins in all_horizons:
@@ -836,8 +835,8 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
         horizon_probs[h_mins] = round(float(p_pos), 3)
 
         if h_mins == PREDICT_HORIZON_MINS:
-            primary_model = clf
             primary_train_df = h_train
+            primary_y = h_y
             primary_weights = weights
 
     prob_pos = horizon_probs.get(PREDICT_HORIZON_MINS, 0.0)
@@ -846,27 +845,22 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
     predicted_state = positive_state if prob_pos >= prob_neg else negative_state
 
     # Pure schedule model for next_on / next_off & 24h timeline
-    if primary_train_df is not None and primary_weights is not None:
+    if primary_train_df is not None and primary_y is not None and primary_weights is not None:
         schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-        schedule_model.fit(
-            primary_train_df[schedule_cols],
-            base_df.loc[primary_train_df.index, "current_state_bin"].shift(-primary_shift).astype(int),
-            sample_weight=primary_weights,
-        )
+        schedule_model.fit(primary_train_df[schedule_cols], primary_y, sample_weight=primary_weights)
         next_on, next_off, timeline_24h = estimate_next_transitions(
             schedule_model, now_dt, curr_bin, is_workday_today, is_workday_tomorrow
         )
     else:
         next_on, next_off, timeline_24h = None, None, None
 
-    # --- Self-Evaluating Accuracy & Adaptive Threshold (#5) ---
+    # --- Self-Evaluating Accuracy & Adaptive Threshold ---
     ent_acc = acc_stats.get(eid, {})
     acc_7d = ent_acc.get("accuracy_7d")
     eval_count_7d = ent_acc.get("count_7d", 0)
 
     effective_threshold = CERTAINTY_THRESHOLD
     if eval_count_7d >= 20 and acc_7d is not None and acc_7d < MIN_ACCEPTABLE_ACCURACY:
-        # Automatically tighten threshold when an entity proves noisy/unpredictable
         penalty = min(0.18, (MIN_ACCEPTABLE_ACCURACY - acc_7d) * 0.75)
         effective_threshold = round(min(0.90, CERTAINTY_THRESHOLD + penalty), 3)
 
@@ -890,7 +884,6 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
         "last_updated": local_now.isoformat(),
     }
 
-    # Add multi-horizon probabilities (prob_15m, prob_30m, prob_60m, prob_180m)
     for h_mins, h_prob in horizon_probs.items():
         meta[f"prob_{h_mins}m"] = h_prob
 
