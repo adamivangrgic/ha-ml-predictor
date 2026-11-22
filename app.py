@@ -33,6 +33,7 @@ RESAMPLE_MINS = int(os.getenv("RESAMPLE_MINS", "5"))
 INITIAL_HISTORY_DAYS = int(os.getenv("INITIAL_HISTORY_DAYS", "10"))
 MIN_HISTORY_HOURS = int(os.getenv("MIN_HISTORY_HOURS", "24"))
 DECAY_HALF_LIFE_DAYS = float(os.getenv("DECAY_HALF_LIFE_DAYS", "7.0"))
+MAX_NEXT_STATES = int(os.getenv("MAX_NEXT_STATES", "5"))
 DB_PATH = os.getenv("DB_PATH", "/data/history.db")
 
 HEADERS = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
@@ -182,10 +183,11 @@ def build_features(df, is_person=False):
     return df, feature_cols, schedule_cols
 
 
-def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
-    """Vectorized 7-day scan using pure schedule features so frozen GPS/duration cannot lock predictions."""
+def estimate_next_transitions(schedule_model, now_dt, current_state_bin, positive_state, negative_state):
+    """Vectorized 7-day scan using pure schedule features to find next ON/OFF and upcoming state sequence."""
     next_on = None
     next_off = None
+    next_states = []
 
     total_steps = (7 * 24 * 60) // RESAMPLE_MINS
     steps = np.arange(1, total_steps + 1)
@@ -210,16 +212,29 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
 
     sim_state = current_state_bin
     for idx, pred in enumerate(preds):
-        if sim_state == 0 and pred == 1 and next_on is None:
-            next_on = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
-        elif sim_state == 1 and pred == 0 and next_off is None:
-            next_off = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
+        if pred != sim_state:
+            ts_local = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
+            state_label = positive_state if pred == 1 else negative_state
+            state_conf = float(prob_pos[idx]) if pred == 1 else float(1.0 - prob_pos[idx])
 
-        sim_state = pred
-        if next_on and next_off:
-            break
+            if sim_state == 0 and pred == 1 and next_on is None:
+                next_on = ts_local
+            elif sim_state == 1 and pred == 0 and next_off is None:
+                next_off = ts_local
 
-    return next_on, next_off
+            if len(next_states) < MAX_NEXT_STATES:
+                next_states.append({
+                    "state": state_label,
+                    "at": ts_local,
+                    "confidence": round(state_conf, 2),
+                })
+
+            sim_state = pred
+
+            if next_on and next_off and len(next_states) >= MAX_NEXT_STATES:
+                break
+
+    return next_on, next_off, next_states
 
 
 def train_and_predict(conn, entity_item):
@@ -274,6 +289,7 @@ def train_and_predict(conn, entity_item):
             "reason": "constant_historical_state",
             "expected_next_on": None,
             "expected_next_off": None,
+            "expected_next_states": [],
             "recorded_hours": round(span_hours, 1),
         }
 
@@ -288,7 +304,7 @@ def train_and_predict(conn, entity_item):
     model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
     model.fit(X, y, sample_weight=sample_weights)
 
-    # 2. Pure schedule model for next_on / next_off forecasting
+    # 2. Pure schedule model for next_on / next_off & transition sequence forecasting
     schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
     schedule_model.fit(train_df[schedule_cols], y, sample_weight=sample_weights)
 
@@ -313,7 +329,9 @@ def train_and_predict(conn, entity_item):
     max_prob = max(prob_pos, prob_neg)
     predicted_state = positive_state if prob_pos >= prob_neg else negative_state
 
-    next_on, next_off = estimate_next_transitions(schedule_model, now_dt, curr_bin)
+    next_on, next_off, next_states = estimate_next_transitions(
+        schedule_model, now_dt, curr_bin, positive_state, negative_state
+    )
 
     meta = {
         "probability_active": round(float(prob_pos), 3),
@@ -322,6 +340,7 @@ def train_and_predict(conn, entity_item):
         "horizon_mins": PREDICT_HORIZON_MINS,
         "expected_next_on": next_on,
         "expected_next_off": next_off,
+        "expected_next_states": next_states,
         "mins_in_current_state": round(mins_in_state, 1),
         "recorded_hours": round(span_hours, 1),
         "last_updated": now_dt.astimezone(LOCAL_TZ).isoformat(),
