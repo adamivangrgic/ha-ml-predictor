@@ -17,7 +17,7 @@ from sklearn.ensemble import RandomForestClassifier
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ha-ml-predictor")
 
-# --- Configuration ---
+# --- Configuration via Environment Variables ---
 HA_URL = os.getenv("HA_URL", "http://homeassistant.local:8123").rstrip("/")
 HA_TOKEN = os.getenv("HA_TOKEN", "")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
@@ -26,6 +26,7 @@ MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
 MQTT_PREFIX = os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant")
 
+# Comma-separated wildcards for binary sensors (e.g., "binary_sensor.*_motion,binary_sensor.front_door")
 BINARY_SENSOR_PATTERNS = [p.strip() for p in os.getenv("BINARY_SENSOR_PATTERNS", "").split(",") if p.strip()]
 CERTAINTY_THRESHOLD = float(os.getenv("CERTAINTY_THRESHOLD", "0.70"))
 PREDICT_HORIZON_MINS = int(os.getenv("PREDICT_HORIZON_MINS", "30"))
@@ -50,7 +51,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# --- Database Layer ---
+# --- Database Layer (Prevents HA Purge Loss) ---
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -84,11 +85,11 @@ def archive_states(conn, states_list):
             if not entity_id or not ts or state in ("unavailable", "unknown", None):
                 continue
             try:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO state_history (entity_id, timestamp, state, attributes) VALUES (?, ?, ?, ?)",
                     (entity_id, ts, state, attrs),
                 )
-                inserted += 1
+                inserted += cur.rowcount
             except sqlite3.Error as e:
                 log.error(f"DB Insert error: {e}")
     conn.commit()
@@ -133,17 +134,17 @@ def sync_history(conn, targets):
             start_dt = datetime.now(timezone.utc) - timedelta(days=INITIAL_HISTORY_DAYS)
 
         url = f"{HA_URL}/api/history/period/{start_dt.isoformat()}"
-        params = {"filter_entity_id": eid, "significant_changes_only": "1"}
+        params = {"filter_entity_id": eid}
         try:
             resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
             if resp.status_code == 200:
                 count = archive_states(conn, resp.json())
                 if count > 0:
-                    log.info(f"Archived {count} new state transitions for {eid}")
+                    log.info(f"Archived {count} new state entries for {eid}")
         except Exception as e:
             log.warning(f"Failed syncing history for {eid}: {e}")
 
-        # Always ensure current live state is recorded so quiet entities still build timeline span
+        # Ensure live state is recorded so steady-state entities maintain timeline continuity
         ts_now = item.get("last_changed") or datetime.now(timezone.utc).isoformat()
         state_now = item.get("state")
         if state_now not in ("unavailable", "unknown", None):
@@ -168,7 +169,7 @@ def build_features(df, is_person=False):
 
     feature_cols = [
         "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend",
-        "current_state_bin", "mins_in_current_state"
+        "current_state_bin", "mins_in_current_state",
     ]
 
     if is_person:
@@ -183,34 +184,59 @@ def build_features(df, is_person=False):
 
 
 def estimate_next_transitions(model, feature_cols, now_dt, current_row, is_person):
-    """Scans the next 24 hours in 15-min steps to find expected next ON/HOME and OFF/AWAY times."""
+    """Autoregressively scans up to 7 days in 15-min steps to find expected next ON/OFF times."""
     next_on = None
     next_off = None
-    curr_bin = current_row["current_state_bin"].iloc[0]
 
-    future_rows = []
-    for step in range(1, 97):  # 96 * 15m = 24 hours
-        fut_ts = now_dt + timedelta(minutes=15 * step)
-        row = current_row.iloc[0].to_dict()
-        row["timestamp"] = fut_ts
-        row["mins_in_current_state"] = row["mins_in_current_state"] + (15 * step)
-        future_rows.append(row)
+    sim_state_bin = int(current_row["current_state_bin"].iloc[0])
+    sim_mins_in_state = float(current_row["mins_in_current_state"].iloc[0])
+    base_attrs = current_row["attr_dict"].iloc[0]
 
-    fut_df = pd.DataFrame(future_rows)
-    fut_df, _ = build_features(fut_df, is_person=is_person)
-    preds = model.predict(fut_df[feature_cols])
+    # Pre-build timestamps and cyclical calendar features for all 672 steps (7 days) at once
+    steps = np.arange(1, 673)
+    fut_timestamps = pd.to_datetime([now_dt + timedelta(minutes=15 * int(s)) for s in steps], utc=True)
+    hours = fut_timestamps.hour + fut_timestamps.minute / 60.0
+    dows = fut_timestamps.dayofweek
 
-    # Track state transitions across the forecast horizon
-    prev_state = curr_bin
-    for idx, pred in enumerate(preds):
-        fut_ts = future_rows[idx]["timestamp"]
-        if prev_state == 0 and pred == 1 and next_on is None:
-            next_on = fut_ts.astimezone().isoformat()
-        elif prev_state == 1 and pred == 0 and next_off is None:
-            next_off = fut_ts.astimezone().isoformat()
-        prev_state = pred
+    hour_sin = np.sin(2 * np.pi * hours / 24.0)
+    hour_cos = np.cos(2 * np.pi * hours / 24.0)
+    dow_sin = np.sin(2 * np.pi * dows / 7.0)
+    dow_cos = np.cos(2 * np.pi * dows / 7.0)
+    is_weekend = (dows >= 5).astype(int)
+
+    if is_person:
+        dist_km = haversine_km(base_attrs.get("latitude"), base_attrs.get("longitude"), HOME_COORDS[0], HOME_COORDS[1])
+        gps_acc = float(base_attrs.get("gps_accuracy", 0) or 0)
+
+    for idx in range(len(steps)):
+        if is_person:
+            row_vals = [[
+                hour_sin[idx], hour_cos[idx], dow_sin[idx], dow_cos[idx], is_weekend[idx],
+                sim_state_bin, sim_mins_in_state, dist_km, gps_acc,
+            ]]
+        else:
+            row_vals = [[
+                hour_sin[idx], hour_cos[idx], dow_sin[idx], dow_cos[idx], is_weekend[idx],
+                sim_state_bin, sim_mins_in_state,
+            ]]
+
+        X_step = pd.DataFrame(row_vals, columns=feature_cols)
+        pred = int(model.predict(X_step)[0])
+
+        if sim_state_bin == 0 and pred == 1 and next_on is None:
+            next_on = fut_timestamps[idx].astimezone().isoformat()
+        elif sim_state_bin == 1 and pred == 0 and next_off is None:
+            next_off = fut_timestamps[idx].astimezone().isoformat()
+
         if next_on and next_off:
             break
+
+        # Advance simulated state for the next 15-minute step
+        if pred != sim_state_bin:
+            sim_state_bin = pred
+            sim_mins_in_state = 15.0
+        else:
+            sim_mins_in_state += 15.0
 
     return next_on, next_off
 
@@ -233,7 +259,7 @@ def train_and_predict(conn, entity_item):
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
 
-    # Check total time span instead of raw state-change count
+    # Validate total time span instead of raw state-change count
     span_hours = (now_dt - df["timestamp"].min()).total_seconds() / 3600.0
     if span_hours < MIN_HISTORY_HOURS:
         return "unknown", 0.0, {
@@ -242,7 +268,7 @@ def train_and_predict(conn, entity_item):
             "required_hours": MIN_HISTORY_HOURS,
         }
 
-    # Append a 'now' anchor row so resampling extends right up to the present moment
+    # Anchor timeline up to the current timestamp
     now_anchor = pd.DataFrame([{
         "timestamp": now_dt,
         "state": entity_item.get("state"),
@@ -250,11 +276,11 @@ def train_and_predict(conn, entity_item):
     }])
     df = pd.concat([df, now_anchor], ignore_index=True)
 
-    # Track how long the entity has been in its current state at every point
+    # Track continuous duration in each state
     df["state_change_group"] = (df["state"] != df["state"].shift()).cumsum()
     df["group_start_ts"] = df.groupby("state_change_group")["timestamp"].transform("first")
 
-    # Resample to 15-min grid (turns 10 transitions over 10 days into ~960 time-slice samples)
+    # Resample onto a 15-minute grid
     df = df.set_index("timestamp").resample("15min").ffill().dropna(subset=["state"]).reset_index()
     df["attr_dict"] = df["attributes"].apply(json.loads)
     df["current_state_bin"] = (df["state"] == positive_state).astype(int)
@@ -265,7 +291,6 @@ def train_and_predict(conn, entity_item):
     train_df = df.dropna(subset=["future_target"]).copy()
 
     if train_df["future_target"].nunique() < 2:
-        # Entity has never changed state in recorded history (e.g., closed-off room)
         const_state = positive_state if train_df["future_target"].iloc[0] == 1 else negative_state
         return const_state, 1.0, {
             "reason": "constant_historical_state",
@@ -278,7 +303,7 @@ def train_and_predict(conn, entity_item):
     X = train_df[feature_cols]
     y = train_df["future_target"].astype(int)
 
-    # Exponential recency weights so closed-off rooms or schedule shifts adapt quickly
+    # Exponential recency weights so vacations or closed-off rooms adapt quickly
     age_days = (now_dt - train_df["timestamp"]).dt.total_seconds() / 86400.0
     sample_weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
 
@@ -341,11 +366,9 @@ def setup_mqtt():
 
 def publish_ha_discovery(client, entity_item, state, attributes):
     eid = entity_item["entity_id"]
-    # Strip domain prefix (e.g., "person.alex" -> "alex", "binary_sensor.kitchen_motion" -> "kitchen_motion")
     object_slug = eid.split(".", 1)[1]
     friendly_name = entity_item.get("attributes", {}).get("friendly_name", object_slug.replace("_", " ").title())
 
-    # Strictly follow HA naming convention: <entity_name>_predicted
     default_entity_id = f"sensor.{object_slug}_predicted"
     unique_id = f"{object_slug}_predicted"
 
@@ -393,7 +416,8 @@ def main():
                 pred_state, cert, meta = train_and_predict(conn, item)
                 publish_ha_discovery(mqtt_client, item, pred_state, meta)
                 log.info(
-                    f"{item['entity_id']} -> {pred_state} (cert: {cert:.2f}, next_on: {meta.get('expected_next_on')})"
+                    f"{item['entity_id']} -> {pred_state} "
+                    f"(cert: {cert:.2f}, next_on: {meta.get('expected_next_on')}, next_off: {meta.get('expected_next_off')})"
                 )
 
         except Exception as e:
