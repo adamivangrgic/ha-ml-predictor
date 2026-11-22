@@ -33,7 +33,6 @@ RESAMPLE_MINS = int(os.getenv("RESAMPLE_MINS", "5"))
 INITIAL_HISTORY_DAYS = int(os.getenv("INITIAL_HISTORY_DAYS", "10"))
 MIN_HISTORY_HOURS = int(os.getenv("MIN_HISTORY_HOURS", "24"))
 DECAY_HALF_LIFE_DAYS = float(os.getenv("DECAY_HALF_LIFE_DAYS", "7.0"))
-MAX_NEXT_STATES = int(os.getenv("MAX_NEXT_STATES", "5"))
 DB_PATH = os.getenv("DB_PATH", "/data/history.db")
 
 HEADERS = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
@@ -183,11 +182,39 @@ def build_features(df, is_person=False):
     return df, feature_cols, schedule_cols
 
 
-def estimate_next_transitions(schedule_model, now_dt, current_state_bin, positive_state, negative_state):
-    """Vectorized 7-day scan using pure schedule features to find next ON/OFF and upcoming state sequence."""
+def build_24h_ascii_timeline(schedule_model, now_dt, threshold):
+    """Generates a 48-char (30-min/char) high-contrast ASCII timeline for the next 24 hours."""
+    # Sample at the midpoint (+15m) of each 30-minute slot for 48 slots
+    slot_offsets = np.arange(48) * 30 + 15
+    slot_timestamps = pd.to_datetime([now_dt + timedelta(minutes=int(m)) for m in slot_offsets], utc=True)
+    hours = slot_timestamps.hour + slot_timestamps.minute / 60.0
+    dows = slot_timestamps.day_of_week
+
+    X_slots = pd.DataFrame({
+        "hour_sin": np.sin(2 * np.pi * hours / 24.0),
+        "hour_cos": np.cos(2 * np.pi * hours / 24.0),
+        "dow_sin": np.sin(2 * np.pi * dows / 7.0),
+        "dow_cos": np.cos(2 * np.pi * dows / 7.0),
+        "is_weekend": (dows >= 5).astype(int),
+    })
+
+    probs = schedule_model.predict_proba(X_slots)
+    classes = list(schedule_model.classes_)
+    prob_pos = probs[:, classes.index(1)] if 1 in classes else np.zeros(48)
+
+    chars = []
+    for i, p in enumerate(prob_pos):
+        if i > 0 and i % 12 == 0:  # '|' separator every 6 hours (12 half-hour slots)
+            chars.append("|")
+        chars.append("█" if p >= threshold else "·")
+
+    return "".join(chars)
+
+
+def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
+    """Vectorized 7-day scan using pure schedule features + 24h ASCII timeline builder."""
     next_on = None
     next_off = None
-    next_states = []
 
     total_steps = (7 * 24 * 60) // RESAMPLE_MINS
     steps = np.arange(1, total_steps + 1)
@@ -212,29 +239,17 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin, positiv
 
     sim_state = current_state_bin
     for idx, pred in enumerate(preds):
-        if pred != sim_state:
-            ts_local = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
-            state_label = positive_state if pred == 1 else negative_state
-            state_conf = float(prob_pos[idx]) if pred == 1 else float(1.0 - prob_pos[idx])
+        if sim_state == 0 and pred == 1 and next_on is None:
+            next_on = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
+        elif sim_state == 1 and pred == 0 and next_off is None:
+            next_off = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
 
-            if sim_state == 0 and pred == 1 and next_on is None:
-                next_on = ts_local
-            elif sim_state == 1 and pred == 0 and next_off is None:
-                next_off = ts_local
+        sim_state = pred
+        if next_on and next_off:
+            break
 
-            if len(next_states) < MAX_NEXT_STATES:
-                next_states.append({
-                    "state": state_label,
-                    "at": ts_local,
-                    "confidence": round(state_conf, 2),
-                })
-
-            sim_state = pred
-
-            if next_on and next_off and len(next_states) >= MAX_NEXT_STATES:
-                break
-
-    return next_on, next_off, next_states
+    timeline_24h = build_24h_ascii_timeline(schedule_model, now_dt, threshold)
+    return next_on, next_off, timeline_24h
 
 
 def train_and_predict(conn, entity_item):
@@ -284,12 +299,17 @@ def train_and_predict(conn, entity_item):
     train_df = df.dropna(subset=["future_target"]).copy()
 
     if train_df["future_target"].nunique() < 2:
-        const_state = positive_state if train_df["future_target"].iloc[0] == 1 else negative_state
+        const_val = int(train_df["future_target"].iloc[0])
+        const_state = positive_state if const_val == 1 else negative_state
+        glyph = "█" if const_val == 1 else "·"
+        flat_line = "|".join([glyph * 12] * 4)
         return const_state, 1.0, {
             "reason": "constant_historical_state",
             "expected_next_on": None,
             "expected_next_off": None,
-            "expected_next_states": [],
+            "timeline_24h": flat_line,
+            "timeline_start": now_dt.astimezone(LOCAL_TZ).strftime("%H:%M"),
+            "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
             "recorded_hours": round(span_hours, 1),
         }
 
@@ -304,7 +324,7 @@ def train_and_predict(conn, entity_item):
     model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
     model.fit(X, y, sample_weight=sample_weights)
 
-    # 2. Pure schedule model for next_on / next_off & transition sequence forecasting
+    # 2. Pure schedule model for next_on / next_off & 24h timeline forecasting
     schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
     schedule_model.fit(train_df[schedule_cols], y, sample_weight=sample_weights)
 
@@ -329,9 +349,7 @@ def train_and_predict(conn, entity_item):
     max_prob = max(prob_pos, prob_neg)
     predicted_state = positive_state if prob_pos >= prob_neg else negative_state
 
-    next_on, next_off, next_states = estimate_next_transitions(
-        schedule_model, now_dt, curr_bin, positive_state, negative_state
-    )
+    next_on, next_off, timeline_24h = estimate_next_transitions(schedule_model, now_dt, curr_bin)
 
     meta = {
         "probability_active": round(float(prob_pos), 3),
@@ -340,7 +358,9 @@ def train_and_predict(conn, entity_item):
         "horizon_mins": PREDICT_HORIZON_MINS,
         "expected_next_on": next_on,
         "expected_next_off": next_off,
-        "expected_next_states": next_states,
+        "timeline_24h": timeline_24h,
+        "timeline_start": now_dt.astimezone(LOCAL_TZ).strftime("%H:%M"),
+        "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
         "mins_in_current_state": round(mins_in_state, 1),
         "recorded_hours": round(span_hours, 1),
         "last_updated": now_dt.astimezone(LOCAL_TZ).isoformat(),
@@ -418,7 +438,7 @@ def main():
                 publish_ha_discovery(mqtt_client, item, pred_state, meta)
                 log.info(
                     f"{item['entity_id']} -> {pred_state} "
-                    f"(cert: {cert:.2f}, next_on: {meta.get('expected_next_on')}, next_off: {meta.get('expected_next_off')})"
+                    f"(cert: {cert:.2f}, 24h: {meta.get('timeline_24h')})"
                 )
 
         except Exception as e:
