@@ -28,7 +28,7 @@ MQTT_PREFIX = os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant")
 # Tier 1: Entities to predict (all person.* are always included automatically)
 BINARY_SENSOR_PATTERNS = [p.strip() for p in os.getenv("BINARY_SENSOR_PATTERNS", "").split(",") if p.strip()]
 
-# Tier 2: Optional context entities for cross-sensor correlation (not predicted, rolling retention)
+# Tier 2: Optional context entities for cross-sensor correlation
 CONTEXT_ENTITY_PATTERNS = [
     p.strip()
     for p in os.getenv("CONTEXT_ENTITY_PATTERNS", "light.*,media_player.*,lock.*,cover.*,binary_sensor.*_door").split(",")
@@ -43,8 +43,15 @@ EXCLUDE_PATTERNS = [
     if p.strip()
 ]
 
+# Workday / Holiday sensor in Home Assistant (falls back to Mon-Fri if not found)
+WORKDAY_ENTITY_ID = os.getenv("WORKDAY_ENTITY_ID", "binary_sensor.workday_sensor").strip()
+
 CERTAINTY_THRESHOLD = float(os.getenv("CERTAINTY_THRESHOLD", "0.70"))
+MIN_ACCEPTABLE_ACCURACY = float(os.getenv("MIN_ACCEPTABLE_ACCURACY", "0.65"))
 PREDICT_HORIZON_MINS = int(os.getenv("PREDICT_HORIZON_MINS", "30"))
+EXTRA_HORIZONS_MINS = [
+    int(h.strip()) for h in os.getenv("EXTRA_HORIZONS_MINS", "15,30,60,180").split(",") if h.strip()
+]
 RESAMPLE_MINS = int(os.getenv("RESAMPLE_MINS", "5"))
 VELOCITY_LOOKBACK_MINS = int(os.getenv("VELOCITY_LOOKBACK_MINS", "15"))
 INITIAL_HISTORY_DAYS = int(os.getenv("INITIAL_HISTORY_DAYS", "10"))
@@ -96,7 +103,7 @@ def state_to_binary(state_str, is_person=False):
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    # Tier 1: Permanent archive for predicted entities
+    # Tier 1: Permanent archive for predicted entities + workday sensor
     conn.execute("""
         CREATE TABLE IF NOT EXISTS state_history (
             entity_id TEXT,
@@ -106,7 +113,7 @@ def init_db():
             PRIMARY KEY (entity_id, timestamp)
         )
     """)
-    # Tier 2: Rolling short-term archive for context entities (pruned automatically)
+    # Tier 2: Rolling short-term archive for context entities
     conn.execute("""
         CREATE TABLE IF NOT EXISTS context_history (
             entity_id TEXT,
@@ -115,8 +122,21 @@ def init_db():
             PRIMARY KEY (entity_id, timestamp)
         )
     """)
+    # Self-evaluation log for tracking real-world prediction accuracy
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prediction_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id TEXT,
+            predicted_at TEXT,
+            target_ts TEXT,
+            predicted_state TEXT,
+            actual_state TEXT,
+            is_correct INTEGER
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_state_hist_eid ON state_history(entity_id, timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ctx_hist_eid ON context_history(entity_id, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pred_log_eid ON prediction_log(entity_id, target_ts)")
     conn.commit()
     return conn
 
@@ -127,12 +147,15 @@ def get_last_timestamp(conn, table, entity_id):
     return row[0] if row and row[0] else None
 
 
-def prune_context_history(conn):
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
-    cur = conn.execute("DELETE FROM context_history WHERE timestamp < ?", (cutoff,))
+def prune_old_records(conn):
+    ctx_cutoff = (datetime.now(timezone.utc) - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
+    cur1 = conn.execute("DELETE FROM context_history WHERE timestamp < ?", (ctx_cutoff,))
+
+    log_cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    cur2 = conn.execute("DELETE FROM prediction_log WHERE predicted_at < ?", (log_cutoff,))
     conn.commit()
-    if cur.rowcount > 0:
-        log.info(f"Pruned {cur.rowcount} expired context_history rows older than {CONTEXT_RETENTION_DAYS} days.")
+    if cur1.rowcount > 0 or cur2.rowcount > 0:
+        log.info(f"Pruned {cur1.rowcount} context rows and {cur2.rowcount} old prediction logs.")
 
 
 def archive_states(conn, states_list, is_context=False):
@@ -168,6 +191,76 @@ def archive_states(conn, states_list, is_context=False):
     return inserted
 
 
+# --- Self-Evaluating Accuracy Tracking (#5) ---
+def evaluate_past_predictions(conn):
+    """Grades matured predictions against archived state_history and returns 7d accuracy stats per entity."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pending = conn.execute(
+        "SELECT id, entity_id, target_ts, predicted_state FROM prediction_log WHERE actual_state IS NULL AND target_ts <= ?",
+        (now_iso,),
+    ).fetchall()
+
+    for row_id, eid, target_ts, pred_state in pending:
+        # Find the active state at target_ts (latest transition at or before target_ts)
+        cur = conn.execute(
+            "SELECT state FROM state_history WHERE entity_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
+            (eid, target_ts),
+        )
+        res = cur.fetchone()
+        if not res:
+            continue
+
+        raw_actual = res[0]
+        is_p = eid.startswith("person.")
+        if is_p:
+            norm_actual = "home" if raw_actual == "home" else "not_home"
+        else:
+            norm_actual = "on" if str(raw_actual).lower() in ACTIVE_STATES else "off"
+
+        is_correct = 1 if pred_state == norm_actual else 0
+        conn.execute(
+            "UPDATE prediction_log SET actual_state = ?, is_correct = ? WHERE id = ?",
+            (norm_actual, is_correct, row_id),
+        )
+    conn.commit()
+
+    cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    stats = {}
+    rows = conn.execute(
+        """
+        SELECT entity_id, COUNT(*), AVG(is_correct)
+        FROM prediction_log
+        WHERE actual_state IS NOT NULL AND predicted_at >= ?
+        GROUP BY entity_id
+        """,
+        (cutoff_7d,),
+    ).fetchall()
+
+    for eid, count, avg_acc in rows:
+        stats[eid] = {"count_7d": int(count), "accuracy_7d": round(float(avg_acc), 3)}
+    return stats
+
+
+def record_prediction(conn, eid, now_dt, horizon_mins, predicted_state):
+    """Logs non-unknown predictions (throttled to 1 entry per entity every 15 mins to avoid bloat)."""
+    if predicted_state == "unknown":
+        return
+    recent_cutoff = (now_dt - timedelta(minutes=14)).isoformat()
+    exists = conn.execute(
+        "SELECT 1 FROM prediction_log WHERE entity_id = ? AND predicted_at >= ? LIMIT 1",
+        (eid, recent_cutoff),
+    ).fetchone()
+    if exists:
+        return
+
+    target_dt = now_dt + timedelta(minutes=horizon_mins)
+    conn.execute(
+        "INSERT INTO prediction_log (entity_id, predicted_at, target_ts, predicted_state) VALUES (?, ?, ?, ?)",
+        (eid, now_dt.isoformat(), target_dt.isoformat(), predicted_state),
+    )
+    conn.commit()
+
+
 # --- Home Assistant API ---
 def fetch_home_coords():
     global HOME_COORDS
@@ -192,9 +285,12 @@ def get_entities():
     targets = []
     target_ids = set()
     context_entities = []
+    workday_item = None
 
     for item in all_states:
         eid = item["entity_id"]
+        if WORKDAY_ENTITY_ID and eid == WORKDAY_ENTITY_ID:
+            workday_item = item
         if eid.startswith("person."):
             targets.append(item)
             target_ids.add(eid)
@@ -204,15 +300,14 @@ def get_entities():
 
     for item in all_states:
         eid = item["entity_id"]
-        if eid in target_ids or is_excluded(eid):
+        if eid in target_ids or eid == WORKDAY_ENTITY_ID or is_excluded(eid):
             continue
         if any(fnmatch.fnmatch(eid, pat) for pat in CONTEXT_ENTITY_PATTERNS):
-            # Only include context entities with discrete/actionable states
             st = str(item.get("state", "")).lower()
             if st in ACTIVE_STATES or st in INACTIVE_STATES:
                 context_entities.append(item)
 
-    return targets, context_entities
+    return targets, context_entities, workday_item
 
 
 def sync_entity_group(conn, entities, is_context=False):
@@ -220,6 +315,8 @@ def sync_entity_group(conn, entities, is_context=False):
     default_days = min(INITIAL_HISTORY_DAYS, CONTEXT_RETENTION_DAYS) if is_context else INITIAL_HISTORY_DAYS
 
     for item in entities:
+        if item is None:
+            continue
         eid = item["entity_id"]
         last_ts = get_last_timestamp(conn, table, eid)
         if last_ts:
@@ -237,7 +334,7 @@ def sync_entity_group(conn, entities, is_context=False):
             resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
             if resp.status_code == 200:
                 count = archive_states(conn, resp.json(), is_context=is_context)
-                if count > 0 and not is_context:
+                if count > 0 and not is_context and eid != WORKDAY_ENTITY_ID:
                     log.info(f"Archived {count} new state entries for {eid}")
         except Exception as e:
             log.warning(f"Failed syncing history for {eid}: {e}")
@@ -262,22 +359,41 @@ def sync_entity_group(conn, entities, is_context=False):
     conn.commit()
 
 
+def get_workday_series(conn, resample_rule, index_like, live_workday_item):
+    """Builds an aligned binary series (1 = workday, 0 = weekend/holiday) from HA workday sensor or Mon-Fri fallback."""
+    fallback = pd.Series((index_like.day_of_week < 5).astype(int), index=index_like)
+    if not WORKDAY_ENTITY_ID:
+        return fallback
+
+    df_w = pd.read_sql_query(
+        "SELECT timestamp, state FROM state_history WHERE entity_id = ? ORDER BY timestamp ASC",
+        conn,
+        params=(WORKDAY_ENTITY_ID,),
+    )
+    if df_w.empty:
+        if live_workday_item and live_workday_item.get("state") in ("on", "off"):
+            val = 1 if live_workday_item.get("state") == "on" else 0
+            return pd.Series(val, index=index_like)
+        return fallback
+
+    df_w["timestamp"] = pd.to_datetime(df_w["timestamp"], format="ISO8601", utc=True)
+    df_w = df_w.drop_duplicates(subset=["timestamp"], keep="last")
+    s = df_w.set_index("timestamp")["state"].apply(lambda x: 1 if str(x).lower() == "on" else 0)
+    s.loc[index_like.max()] = s.iloc[-1]
+    s_res = s.resample(resample_rule).ffill()
+    return s_res.reindex(index_like, method="ffill").fillna(fallback).astype(int)
+
+
 # --- Nightly Cross-Sensor Lagged Correlation Engine ---
 def run_correlation_analysis(conn, all_entity_map):
-    """
-    Finds significant simultaneous and lead/lag relationships across all Tier 1 and Tier 2 entities.
-    Returns:
-      - driver_map: {target_eid: [{"driver_eid": str, "lag_mins": int, "corr": float, "summary": str}, ...]}
-      - top_insights: [str, ...] human-readable household behavioral rules
-    """
     log.info("Running cross-sensor lagged correlation analysis...")
     now_dt = datetime.now(timezone.utc)
     cutoff_str = (now_dt - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
 
     df_t1 = pd.read_sql_query(
-        "SELECT entity_id, timestamp, state FROM state_history WHERE timestamp >= ?",
+        "SELECT entity_id, timestamp, state FROM state_history WHERE timestamp >= ? AND entity_id != ?",
         conn,
-        params=(cutoff_str,),
+        params=(cutoff_str, WORKDAY_ENTITY_ID),
     )
     df_t2 = pd.read_sql_query(
         "SELECT entity_id, timestamp, state FROM context_history WHERE timestamp >= ?",
@@ -292,31 +408,28 @@ def run_correlation_analysis(conn, all_entity_map):
     df_all["timestamp"] = pd.to_datetime(df_all["timestamp"], format="ISO8601", utc=True)
     resample_rule = f"{RESAMPLE_MINS}min"
 
-    # Build aligned binary matrix (rows = time intervals, cols = entity_ids)
     series_dict = {}
     for eid, grp in df_all.groupby("entity_id"):
         grp = grp.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
         is_p = eid.startswith("person.")
         s = grp.set_index("timestamp")["state"].apply(lambda x: state_to_binary(x, is_person=is_p))
-        # Extend timeline to now and resample
         s.loc[now_dt] = s.iloc[-1]
         s_res = s.resample(resample_rule).ffill().dropna()
         if s_res.nunique() >= 2 and len(s_res) >= 48:
             series_dict[eid] = s_res
 
     if len(series_dict) < 2:
-        log.info("Not enough active entities with state transitions for correlation analysis yet.")
         return {}, []
 
     grid = pd.DataFrame(series_dict).ffill().bfill().dropna()
     if len(grid) < 48:
         return {}, []
 
-    target_eids = [eid for eid in grid.columns if eid.startswith("person.") or any(
-        fnmatch.fnmatch(eid, pat) for pat in BINARY_SENSOR_PATTERNS
-    )]
+    target_eids = [
+        eid for eid in grid.columns
+        if eid.startswith("person.") or any(fnmatch.fnmatch(eid, pat) for pat in BINARY_SENSOR_PATTERNS)
+    ]
 
-    # Test simultaneous (0m) and driver-leads-target lags (5m, 10m, 15m)
     lags_mins = [0, 5, 10, 15]
     driver_map = {}
     all_findings = []
@@ -359,11 +472,7 @@ def run_correlation_analysis(conn, all_entity_map):
                     d_action = "leaves home" if d_is_person else "turns off"
                     t_action = "arrives home" if t_is_person else "activates"
 
-                if best_lag == 0:
-                    timing = "at the same time"
-                else:
-                    timing = f"~{best_lag}m before {t_name} {t_action}"
-
+                timing = "at the same time" if best_lag == 0 else f"~{best_lag}m before {t_name} {t_action}"
                 summary = f"{d_name} {d_action} {timing} (r={best_corr:+.2f})"
                 candidates.append({
                     "driver_eid": driver,
@@ -371,13 +480,14 @@ def run_correlation_analysis(conn, all_entity_map):
                     "corr": round(best_corr, 3),
                     "summary": summary,
                 })
-                all_findings.append((abs(best_corr), f"When {d_name} {d_action}, {t_name} {t_action} {timing if best_lag > 0 else 'simultaneously'} (r={best_corr:+.2f})"))
+                all_findings.append((
+                    abs(best_corr),
+                    f"When {d_name} {d_action}, {t_name} {t_action} {timing if best_lag > 0 else 'simultaneously'} (r={best_corr:+.2f})",
+                ))
 
-        # Keep top 3 strongest drivers per target
         candidates.sort(key=lambda x: abs(x["corr"]), reverse=True)
         driver_map[target] = candidates[:3]
 
-    # Deduplicate and sort global household insights
     all_findings.sort(key=lambda x: x[0], reverse=True)
     seen = set()
     top_insights = []
@@ -388,15 +498,16 @@ def run_correlation_analysis(conn, all_entity_map):
         if len(top_insights) >= 15:
             break
 
-    log.info(f"Correlation analysis complete: found {len(top_insights)} strong behavioral rules across {len(grid.columns)} entities.")
+    log.info(f"Correlation analysis complete: found {len(top_insights)} strong rules across {len(grid.columns)} entities.")
     return driver_map, top_insights
 
 
 def get_driver_history_series(conn, driver_eid, lag_mins, resample_rule, index_like):
-    """Fetches a resampled, lag-shifted binary series for a correlated driver entity."""
-    table = "state_history" if (
-        driver_eid.startswith("person.") or any(fnmatch.fnmatch(driver_eid, pat) for pat in BINARY_SENSOR_PATTERNS)
-    ) else "context_history"
+    table = (
+        "state_history"
+        if (driver_eid.startswith("person.") or any(fnmatch.fnmatch(driver_eid, pat) for pat in BINARY_SENSOR_PATTERNS))
+        else "context_history"
+    )
 
     df_d = pd.read_sql_query(
         f"SELECT timestamp, state FROM {table} WHERE entity_id = ? ORDER BY timestamp ASC",
@@ -426,13 +537,15 @@ def build_features(df, is_person=False, driver_cols=None):
     df["hour"] = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
     df["dow"] = df["timestamp"].dt.day_of_week
     df["is_weekend"] = (df["dow"] >= 5).astype(int)
+    if "is_workday" not in df.columns:
+        df["is_workday"] = (df["dow"] < 5).astype(int)
 
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
     df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
     df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
 
-    schedule_cols = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend"]
+    schedule_cols = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend", "is_workday"]
     feature_cols = schedule_cols + ["current_state_bin", "mins_in_current_state"]
 
     if is_person:
@@ -473,12 +586,16 @@ def build_features(df, is_person=False, driver_cols=None):
     return df, feature_cols, schedule_cols
 
 
-def build_24h_ascii_timeline(schedule_model, now_dt, threshold):
-    """Generates a 48-char (30-min/char) high-contrast ASCII timeline for the next 24 hours."""
+def build_24h_ascii_timeline(schedule_model, now_dt, threshold, is_workday_today, is_workday_tomorrow):
+    """Generates a 48-char (30-min/char) high-contrast ASCII timeline respecting today/tomorrow workday status."""
     slot_offsets = np.arange(48) * 30 + 15
     slot_timestamps = pd.to_datetime([now_dt + timedelta(minutes=int(m)) for m in slot_offsets], utc=True)
+    local_slots = slot_timestamps.tz_convert(LOCAL_TZ)
+    today_date = now_dt.astimezone(LOCAL_TZ).date()
+
     hours = slot_timestamps.hour + slot_timestamps.minute / 60.0
     dows = slot_timestamps.day_of_week
+    workdays = np.array([is_workday_today if ts.date() == today_date else is_workday_tomorrow for ts in local_slots])
 
     X_slots = pd.DataFrame({
         "hour_sin": np.sin(2 * np.pi * hours / 24.0),
@@ -486,6 +603,7 @@ def build_24h_ascii_timeline(schedule_model, now_dt, threshold):
         "dow_sin": np.sin(2 * np.pi * dows / 7.0),
         "dow_cos": np.cos(2 * np.pi * dows / 7.0),
         "is_weekend": (dows >= 5).astype(int),
+        "is_workday": workdays,
     })
 
     probs = schedule_model.predict_proba(X_slots)
@@ -501,16 +619,30 @@ def build_24h_ascii_timeline(schedule_model, now_dt, threshold):
     return "".join(chars)
 
 
-def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
-    """Vectorized 7-day scan using pure schedule features + 24h ASCII timeline builder."""
+def estimate_next_transitions(schedule_model, now_dt, current_state_bin, is_workday_today, is_workday_tomorrow):
+    """Vectorized 7-day scan using schedule + workday awareness + 24h ASCII timeline builder."""
     next_on = None
     next_off = None
 
     total_steps = (7 * 24 * 60) // RESAMPLE_MINS
     steps = np.arange(1, total_steps + 1)
     fut_timestamps = pd.to_datetime([now_dt + timedelta(minutes=RESAMPLE_MINS * int(s)) for s in steps], utc=True)
+    local_fut = fut_timestamps.tz_convert(LOCAL_TZ)
+    today_date = now_dt.astimezone(LOCAL_TZ).date()
+    tomorrow_date = today_date + timedelta(days=1)
+
     hours = fut_timestamps.hour + fut_timestamps.minute / 60.0
     dows = fut_timestamps.day_of_week
+
+    workdays = []
+    for ts, d in zip(local_fut, dows):
+        dt_date = ts.date()
+        if dt_date == today_date:
+            workdays.append(is_workday_today)
+        elif dt_date == tomorrow_date:
+            workdays.append(is_workday_tomorrow)
+        else:
+            workdays.append(1 if d < 5 else 0)
 
     X_fut = pd.DataFrame({
         "hour_sin": np.sin(2 * np.pi * hours / 24.0),
@@ -518,6 +650,7 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
         "dow_sin": np.sin(2 * np.pi * dows / 7.0),
         "dow_cos": np.cos(2 * np.pi * dows / 7.0),
         "is_weekend": (dows >= 5).astype(int),
+        "is_workday": np.array(workdays, dtype=int),
     })
 
     probs = schedule_model.predict_proba(X_fut)
@@ -530,19 +663,19 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
     sim_state = current_state_bin
     for idx, pred in enumerate(preds):
         if sim_state == 0 and pred == 1 and next_on is None:
-            next_on = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
+            next_on = local_fut[idx].isoformat()
         elif sim_state == 1 and pred == 0 and next_off is None:
-            next_off = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
+            next_off = local_fut[idx].isoformat()
 
         sim_state = pred
         if next_on and next_off:
             break
 
-    timeline_24h = build_24h_ascii_timeline(schedule_model, now_dt, threshold)
+    timeline_24h = build_24h_ascii_timeline(schedule_model, now_dt, threshold, is_workday_today, is_workday_tomorrow)
     return next_on, next_off, timeline_24h
 
 
-def train_and_predict(conn, entity_item, drivers, all_entity_map):
+def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, acc_stats):
     eid = entity_item["entity_id"]
     is_person = eid.startswith("person.")
     positive_state = "home" if is_person else "on"
@@ -581,7 +714,11 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map):
     resample_rule = f"{RESAMPLE_MINS}min"
     df_indexed = df.set_index("timestamp").resample(resample_rule).ffill().dropna(subset=["state"])
 
-    # Attach correlated driver history columns onto the same resampled time index
+    # Attach workday/holiday flag series (#3)
+    s_workday = get_workday_series(conn, resample_rule, df_indexed.index, workday_item)
+    df_indexed["is_workday"] = s_workday.values
+
+    # Attach correlated driver history columns
     driver_cols = []
     live_driver_vals = {}
     for idx_d, drv in enumerate(drivers):
@@ -592,7 +729,6 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map):
         df_indexed[col_name] = s_drv.values
         driver_cols.append(col_name)
 
-        # Live driver state (at t - lag_mins, or current state if lag == 0)
         if d_lag == 0 and d_eid in all_entity_map:
             live_st = all_entity_map[d_eid].get("state")
             live_driver_vals[col_name] = state_to_binary(live_st, is_person=d_eid.startswith("person."))
@@ -604,12 +740,21 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map):
     df["current_state_bin"] = (df["state"] == positive_state).astype(int)
     df["mins_in_current_state"] = (df["timestamp"] - df["group_start_ts"]).dt.total_seconds() / 60.0
 
-    shift_steps = max(1, PREDICT_HORIZON_MINS // RESAMPLE_MINS)
-    df["future_target"] = df["current_state_bin"].shift(-shift_steps)
-    train_df = df.dropna(subset=["future_target"]).copy()
+    # Determine today's and tomorrow's workday status
+    local_now = now_dt.astimezone(LOCAL_TZ)
+    if workday_item and workday_item.get("state") in ("on", "off"):
+        is_workday_today = 1 if workday_item.get("state") == "on" else 0
+    else:
+        is_workday_today = 1 if local_now.weekday() < 5 else 0
+    tomorrow_dow = (local_now + timedelta(days=1)).weekday()
+    is_workday_tomorrow = 1 if tomorrow_dow < 5 else 0
 
-    if train_df["future_target"].nunique() < 2:
-        const_val = int(train_df["future_target"].iloc[0])
+    # Check if constant historical state
+    primary_shift = max(1, PREDICT_HORIZON_MINS // RESAMPLE_MINS)
+    primary_target = df["current_state_bin"].shift(-primary_shift).dropna()
+
+    if primary_target.nunique() < 2:
+        const_val = int(primary_target.iloc[0])
         const_state = positive_state if const_val == 1 else negative_state
         glyph = "█" if const_val == 1 else "·"
         flat_line = "|".join([glyph * 12] * 4)
@@ -618,27 +763,16 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map):
             "expected_next_on": None,
             "expected_next_off": None,
             "timeline_24h": flat_line,
-            "timeline_start": now_dt.astimezone(LOCAL_TZ).strftime("%H:%M"),
+            "timeline_start": local_now.strftime("%H:%M"),
             "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
+            "is_workday": bool(is_workday_today),
             "correlated_triggers": [d["summary"] for d in drivers],
             "recorded_hours": round(span_hours, 1),
         }
 
-    train_df, feature_cols, schedule_cols = build_features(train_df, is_person=is_person, driver_cols=driver_cols)
-    X = train_df[feature_cols]
-    y = train_df["future_target"].astype(int)
+    base_df, feature_cols, schedule_cols = build_features(df, is_person=is_person, driver_cols=driver_cols)
 
-    age_days = (now_dt - train_df["timestamp"]).dt.total_seconds() / 86400.0
-    sample_weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
-
-    # 1. Context-aware model (includes live distance, velocity, ETA, correlated drivers + time)
-    model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
-    model.fit(X, y, sample_weight=sample_weights)
-
-    # 2. Pure schedule model for next_on / next_off & 24h timeline forecasting
-    schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-    schedule_model.fit(train_df[schedule_cols], y, sample_weight=sample_weights)
-
+    # Prepare live observation row
     last_changed_str = entity_item.get("last_changed")
     last_changed_dt = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00")) if last_changed_str else now_dt
     mins_in_state = max(0.0, (now_dt - last_changed_dt).total_seconds() / 60.0)
@@ -650,6 +784,7 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map):
         "attr_dict": curr_attrs,
         "current_state_bin": curr_bin,
         "mins_in_current_state": mins_in_state,
+        "is_workday": is_workday_today,
         **live_driver_vals,
     }
 
@@ -671,41 +806,103 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map):
     now_df = pd.DataFrame([live_row])
     now_df, _, _ = build_features(now_df, is_person=is_person, driver_cols=driver_cols)
 
-    probs = model.predict_proba(now_df[feature_cols])[0]
-    classes = list(model.classes_)
-    prob_pos = probs[classes.index(1)] if 1 in classes else 0.0
-    prob_neg = probs[classes.index(0)] if 0 in classes else 0.0
+    # --- Train Multi-Horizon Models (#2) ---
+    all_horizons = sorted(set([PREDICT_HORIZON_MINS] + EXTRA_HORIZONS_MINS))
+    horizon_probs = {}
+    primary_model = None
+    primary_train_df = None
+    primary_weights = None
 
+    for h_mins in all_horizons:
+        h_steps = max(1, h_mins // RESAMPLE_MINS)
+        h_target = base_df["current_state_bin"].shift(-h_steps)
+        valid_mask = h_target.notna()
+        h_train = base_df.loc[valid_mask]
+        h_y = h_target.loc[valid_mask].astype(int)
+
+        if h_y.nunique() < 2 or len(h_train) < 20:
+            horizon_probs[h_mins] = round(float(h_y.mean()), 3) if len(h_y) > 0 else 0.0
+            continue
+
+        age_days = (now_dt - h_train["timestamp"]).dt.total_seconds() / 86400.0
+        weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
+
+        clf = RandomForestClassifier(n_estimators=80, max_depth=8, random_state=42)
+        clf.fit(h_train[feature_cols], h_y, sample_weight=weights)
+
+        p_arr = clf.predict_proba(now_df[feature_cols])[0]
+        cls_list = list(clf.classes_)
+        p_pos = p_arr[cls_list.index(1)] if 1 in cls_list else 0.0
+        horizon_probs[h_mins] = round(float(p_pos), 3)
+
+        if h_mins == PREDICT_HORIZON_MINS:
+            primary_model = clf
+            primary_train_df = h_train
+            primary_weights = weights
+
+    prob_pos = horizon_probs.get(PREDICT_HORIZON_MINS, 0.0)
+    prob_neg = 1.0 - prob_pos
     max_prob = max(prob_pos, prob_neg)
     predicted_state = positive_state if prob_pos >= prob_neg else negative_state
 
-    next_on, next_off, timeline_24h = estimate_next_transitions(schedule_model, now_dt, curr_bin)
+    # Pure schedule model for next_on / next_off & 24h timeline
+    if primary_train_df is not None and primary_weights is not None:
+        schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
+        schedule_model.fit(
+            primary_train_df[schedule_cols],
+            base_df.loc[primary_train_df.index, "current_state_bin"].shift(-primary_shift).astype(int),
+            sample_weight=primary_weights,
+        )
+        next_on, next_off, timeline_24h = estimate_next_transitions(
+            schedule_model, now_dt, curr_bin, is_workday_today, is_workday_tomorrow
+        )
+    else:
+        next_on, next_off, timeline_24h = None, None, None
+
+    # --- Self-Evaluating Accuracy & Adaptive Threshold (#5) ---
+    ent_acc = acc_stats.get(eid, {})
+    acc_7d = ent_acc.get("accuracy_7d")
+    eval_count_7d = ent_acc.get("count_7d", 0)
+
+    effective_threshold = CERTAINTY_THRESHOLD
+    if eval_count_7d >= 20 and acc_7d is not None and acc_7d < MIN_ACCEPTABLE_ACCURACY:
+        # Automatically tighten threshold when an entity proves noisy/unpredictable
+        penalty = min(0.18, (MIN_ACCEPTABLE_ACCURACY - acc_7d) * 0.75)
+        effective_threshold = round(min(0.90, CERTAINTY_THRESHOLD + penalty), 3)
 
     meta = {
-        "probability_active": round(float(prob_pos), 3),
+        "probability_active": prob_pos,
         "certainty": round(float(max_prob), 3),
         "threshold": CERTAINTY_THRESHOLD,
+        "effective_threshold": effective_threshold,
         "horizon_mins": PREDICT_HORIZON_MINS,
         "expected_next_on": next_on,
         "expected_next_off": next_off,
         "timeline_24h": timeline_24h,
-        "timeline_start": now_dt.astimezone(LOCAL_TZ).strftime("%H:%M"),
+        "timeline_start": local_now.strftime("%H:%M"),
         "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
+        "is_workday": bool(is_workday_today),
+        "accuracy_7d": acc_7d,
+        "evaluated_predictions_7d": eval_count_7d,
         "correlated_triggers": [d["summary"] for d in drivers],
         "mins_in_current_state": round(mins_in_state, 1),
         "recorded_hours": round(span_hours, 1),
-        "last_updated": now_dt.astimezone(LOCAL_TZ).isoformat(),
+        "last_updated": local_now.isoformat(),
     }
+
+    # Add multi-horizon probabilities (prob_15m, prob_30m, prob_60m, prob_180m)
+    for h_mins, h_prob in horizon_probs.items():
+        meta[f"prob_{h_mins}m"] = h_prob
 
     if is_person:
         meta["distance_from_home_km"] = round(float(now_df["distance_from_home_km"].iloc[0]), 2)
         meta["home_approach_speed_kmh"] = round(float(now_df["home_approach_speed_kmh"].iloc[0]), 1)
         meta["eta_mins"] = round(float(now_df["eta_mins"].iloc[0]), 0)
 
-    if max_prob < CERTAINTY_THRESHOLD:
-        return "unknown", max_prob, meta
+    final_state = "unknown" if max_prob < effective_threshold else predicted_state
+    record_prediction(conn, eid, now_dt, PREDICT_HORIZON_MINS, final_state)
 
-    return predicted_state, max_prob, meta
+    return final_state, max_prob, meta
 
 
 # --- MQTT Home Assistant Auto-Discovery ---
@@ -751,7 +948,7 @@ def publish_ha_discovery(client, entity_item, state, attributes):
     client.publish(attr_topic, json.dumps(attributes), retain=True)
 
 
-def publish_insights_sensor(client, insights, context_count):
+def publish_insights_sensor(client, insights, context_count, acc_stats):
     unique_id = "ha_ml_behavioral_insights"
     base_topic = f"{MQTT_PREFIX}/sensor/{unique_id}"
     discovery_payload = {
@@ -768,8 +965,14 @@ def publish_insights_sensor(client, insights, context_count):
             "model": "RandomForest State Forecaster",
         },
     }
+    overall_acc = None
+    if acc_stats:
+        overall_acc = round(float(np.mean([v["accuracy_7d"] for v in acc_stats.values()])), 3)
+
     attrs = {
         "insights": insights,
+        "overall_accuracy_7d": overall_acc,
+        "entity_accuracy_7d": acc_stats,
         "context_entities_monitored": context_count,
         "min_correlation_threshold": CORRELATION_MIN_STRENGTH,
         "last_analyzed": datetime.now(timezone.utc).astimezone(LOCAL_TZ).isoformat(),
@@ -795,28 +998,32 @@ def main():
 
     while True:
         try:
-            targets, context_entities = get_entities()
+            targets, context_entities, workday_item = get_entities()
             all_entity_map = {e["entity_id"]: e for e in (targets + context_entities)}
 
-            sync_entity_group(conn, targets, is_context=False)
+            sync_entity_group(conn, targets + ([workday_item] if workday_item else []), is_context=False)
             sync_entity_group(conn, context_entities, is_context=True)
 
-            # Run correlation discovery at startup and every CORRELATION_INTERVAL_HOURS
+            acc_stats = evaluate_past_predictions(conn)
+
             now_utc = datetime.now(timezone.utc)
             if last_corr_run is None or (now_utc - last_corr_run).total_seconds() >= CORRELATION_INTERVAL_HOURS * 3600:
-                prune_context_history(conn)
+                prune_old_records(conn)
                 driver_map, top_insights = run_correlation_analysis(conn, all_entity_map)
-                publish_insights_sensor(mqtt_client, top_insights, len(context_entities))
                 last_corr_run = now_utc
+
+            publish_insights_sensor(mqtt_client, top_insights, len(context_entities), acc_stats)
 
             for item in targets:
                 eid = item["entity_id"]
                 drivers = driver_map.get(eid, [])
-                pred_state, cert, meta = train_and_predict(conn, item, drivers, all_entity_map)
+                pred_state, cert, meta = train_and_predict(
+                    conn, item, drivers, all_entity_map, workday_item, acc_stats
+                )
                 publish_ha_discovery(mqtt_client, item, pred_state, meta)
                 log.info(
                     f"{eid} -> {pred_state} "
-                    f"(cert: {cert:.2f}, drivers: {len(drivers)}, 24h: {meta.get('timeline_24h')})"
+                    f"(cert: {cert:.2f}, acc_7d: {meta.get('accuracy_7d')}, 24h: {meta.get('timeline_24h')})"
                 )
 
         except Exception as e:
