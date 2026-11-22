@@ -1,0 +1,22 @@
+services:
+  ha-ml-predictor:
+    build: .
+    container_name: ha-ml-predictor
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      - HA_URL=http://192.168.1.100:8123
+      - HA_TOKEN=your_long_lived_access_token_here
+      - MQTT_HOST=192.168.1.100
+      - MQTT_PORT=1883
+      - MQTT_USER=mqtt_user
+      - MQTT_PASS=mqtt_password
+      # Wildcard matching for binary sensors (comma-separated)
+      - BINARY_SENSOR_PATTERNS=binary_sensor.*_motion,binary_sensor.*_door
+      # Minimum probability (0.0 to 1.0) required before outputting a prediction instead of 'unknown'
+      - CERTAINTY_THRESHOLD=0.75
+      # How many minutes into the future to predict
+      - PREDICT_HORIZON_MINS=30
+      # Days of history to pull from HA on first boot before relying on local SQLite archive
+      - INITIAL_HISTORY_DAYS=10
