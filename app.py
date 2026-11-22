@@ -30,6 +30,7 @@ BINARY_SENSOR_PATTERNS = [p.strip() for p in os.getenv("BINARY_SENSOR_PATTERNS",
 CERTAINTY_THRESHOLD = float(os.getenv("CERTAINTY_THRESHOLD", "0.70"))
 PREDICT_HORIZON_MINS = int(os.getenv("PREDICT_HORIZON_MINS", "30"))
 RESAMPLE_MINS = int(os.getenv("RESAMPLE_MINS", "5"))
+VELOCITY_LOOKBACK_MINS = int(os.getenv("VELOCITY_LOOKBACK_MINS", "15"))
 INITIAL_HISTORY_DAYS = int(os.getenv("INITIAL_HISTORY_DAYS", "10"))
 MIN_HISTORY_HOURS = int(os.getenv("MIN_HISTORY_HOURS", "24"))
 DECAY_HALF_LIFE_DAYS = float(os.getenv("DECAY_HALF_LIFE_DAYS", "7.0"))
@@ -50,6 +51,14 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def compute_eta_mins(distance_km, approach_speed_kmh, is_home=False):
+    if is_home or distance_km <= 0.1:
+        return 0.0
+    if approach_speed_kmh <= 2.0:  # Stationary or moving away
+        return 1440.0
+    return min(1440.0, (distance_km / approach_speed_kmh) * 60.0)
 
 
 # --- Database Layer (Prevents HA Purge Loss) ---
@@ -80,7 +89,12 @@ def archive_states(conn, states_list):
     for entity_history in states_list:
         for entry in entity_history:
             entity_id = entry.get("entity_id")
-            ts = entry.get("last_changed") or entry.get("last_updated")
+            # Use last_updated for person entities so GPS attribute movements are captured even when state stays 'not_home'
+            if entity_id and entity_id.startswith("person."):
+                ts = entry.get("last_updated") or entry.get("last_changed")
+            else:
+                ts = entry.get("last_changed") or entry.get("last_updated")
+
             state = entry.get("state")
             attrs = json.dumps(entry.get("attributes", {}))
             if not entity_id or not ts or state in ("unavailable", "unknown", None):
@@ -145,8 +159,12 @@ def sync_history(conn, targets):
         except Exception as e:
             log.warning(f"Failed syncing history for {eid}: {e}")
 
-        # Ensure live state is recorded so steady-state entities maintain timeline continuity
-        ts_now = item.get("last_changed") or datetime.now(timezone.utc).isoformat()
+        # Record live snapshot (using last_updated for person entities to capture GPS movement)
+        if eid.startswith("person."):
+            ts_now = item.get("last_updated") or item.get("last_changed") or datetime.now(timezone.utc).isoformat()
+        else:
+            ts_now = item.get("last_changed") or datetime.now(timezone.utc).isoformat()
+
         state_now = item.get("state")
         if state_now not in ("unavailable", "unknown", None):
             conn.execute(
@@ -177,14 +195,40 @@ def build_features(df, is_person=False):
 
         df["distance_from_home_km"] = df["attr_dict"].apply(calc_dist)
         df["gps_accuracy"] = df["attr_dict"].apply(lambda a: float(a.get("gps_accuracy", 0) or 0))
-        feature_cols.extend(["distance_from_home_km", "gps_accuracy"])
+
+        # Compute radial approach speed toward home over VELOCITY_LOOKBACK_MINS
+        if "home_approach_speed_kmh" not in df.columns:
+            lookback_steps = max(1, VELOCITY_LOOKBACK_MINS // RESAMPLE_MINS)
+            lookback_hours = (lookback_steps * RESAMPLE_MINS) / 60.0
+            prev_dist = df["distance_from_home_km"].shift(lookback_steps).fillna(df["distance_from_home_km"])
+            # Positive = getting closer to home; Negative = moving away
+            speed = (prev_dist - df["distance_from_home_km"]) / lookback_hours
+            # Filter out GPS jitter (< 1.5 km/h drift) and unrealistic teleports (> 250 km/h)
+            speed = speed.where(speed.abs() >= 1.5, 0.0).clip(-250.0, 250.0)
+            df["home_approach_speed_kmh"] = speed
+
+        if "eta_mins" not in df.columns:
+            df["eta_mins"] = [
+                compute_eta_mins(d, s, bool(st == 1))
+                for d, s, st in zip(
+                    df["distance_from_home_km"],
+                    df["home_approach_speed_kmh"],
+                    df["current_state_bin"],
+                )
+            ]
+
+        feature_cols.extend([
+            "distance_from_home_km",
+            "gps_accuracy",
+            "home_approach_speed_kmh",
+            "eta_mins",
+        ])
 
     return df, feature_cols, schedule_cols
 
 
 def build_24h_ascii_timeline(schedule_model, now_dt, threshold):
     """Generates a 48-char (30-min/char) high-contrast ASCII timeline for the next 24 hours."""
-    # Sample at the midpoint (+15m) of each 30-minute slot for 48 slots
     slot_offsets = np.arange(48) * 30 + 15
     slot_timestamps = pd.to_datetime([now_dt + timedelta(minutes=int(m)) for m in slot_offsets], utc=True)
     hours = slot_timestamps.hour + slot_timestamps.minute / 60.0
@@ -204,7 +248,7 @@ def build_24h_ascii_timeline(schedule_model, now_dt, threshold):
 
     chars = []
     for i, p in enumerate(prob_pos):
-        if i > 0 and i % 12 == 0:  # '|' separator every 6 hours (12 half-hour slots)
+        if i > 0 and i % 12 == 0:
             chars.append("|")
         chars.append("█" if p >= threshold else "·")
 
@@ -320,7 +364,7 @@ def train_and_predict(conn, entity_item):
     age_days = (now_dt - train_df["timestamp"]).dt.total_seconds() / 86400.0
     sample_weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
 
-    # 1. Context-aware model for short-term state prediction
+    # 1. Context-aware model (includes live distance, approach velocity, ETA, state duration + time)
     model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
     model.fit(X, y, sample_weight=sample_weights)
 
@@ -332,13 +376,32 @@ def train_and_predict(conn, entity_item):
     last_changed_dt = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00")) if last_changed_str else now_dt
     mins_in_state = max(0.0, (now_dt - last_changed_dt).total_seconds() / 60.0)
     curr_bin = 1 if entity_item.get("state") == positive_state else 0
+    curr_attrs = entity_item.get("attributes", {})
 
-    now_df = pd.DataFrame([{
+    live_row = {
         "timestamp": now_dt,
-        "attr_dict": entity_item.get("attributes", {}),
+        "attr_dict": curr_attrs,
         "current_state_bin": curr_bin,
         "mins_in_current_state": mins_in_state,
-    }])
+    }
+
+    if is_person:
+        curr_dist = haversine_km(curr_attrs.get("latitude"), curr_attrs.get("longitude"), HOME_COORDS[0], HOME_COORDS[1])
+        # Look up the archived GPS distance from VELOCITY_LOOKBACK_MINS ago in the resampled dataframe
+        lookback_steps = max(1, VELOCITY_LOOKBACK_MINS // RESAMPLE_MINS)
+        if len(df) > lookback_steps:
+            past_attrs = df["attr_dict"].iloc[-(lookback_steps + 1)]
+            past_dist = haversine_km(past_attrs.get("latitude"), past_attrs.get("longitude"), HOME_COORDS[0], HOME_COORDS[1])
+            lookback_hours = (lookback_steps * RESAMPLE_MINS) / 60.0
+            raw_speed = (past_dist - curr_dist) / lookback_hours
+            approach_speed = 0.0 if abs(raw_speed) < 1.5 else max(-250.0, min(250.0, raw_speed))
+        else:
+            approach_speed = 0.0
+
+        live_row["home_approach_speed_kmh"] = approach_speed
+        live_row["eta_mins"] = compute_eta_mins(curr_dist, approach_speed, bool(curr_bin == 1))
+
+    now_df = pd.DataFrame([live_row])
     now_df, _, _ = build_features(now_df, is_person=is_person)
 
     probs = model.predict_proba(now_df[feature_cols])[0]
@@ -368,6 +431,8 @@ def train_and_predict(conn, entity_item):
 
     if is_person:
         meta["distance_from_home_km"] = round(float(now_df["distance_from_home_km"].iloc[0]), 2)
+        meta["home_approach_speed_kmh"] = round(float(now_df["home_approach_speed_kmh"].iloc[0]), 1)
+        meta["eta_mins"] = round(float(now_df["eta_mins"].iloc[0]), 0)
 
     if max_prob < CERTAINTY_THRESHOLD:
         return "unknown", max_prob, meta
