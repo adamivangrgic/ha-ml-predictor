@@ -37,6 +37,7 @@ DB_PATH = os.getenv("DB_PATH", "/data/history.db")
 
 HEADERS = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
 HOME_COORDS = (None, None)
+LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 
 # --- Geospatial Helper ---
@@ -159,7 +160,7 @@ def sync_history(conn, targets):
 def build_features(df, is_person=False):
     df = df.copy()
     df["hour"] = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
-    df["dow"] = df["timestamp"].dt.dayofweek
+    df["dow"] = df["timestamp"].dt.day_of_week
     df["is_weekend"] = (df["dow"] >= 5).astype(int)
 
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
@@ -190,7 +191,7 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
     steps = np.arange(1, total_steps + 1)
     fut_timestamps = pd.to_datetime([now_dt + timedelta(minutes=RESAMPLE_MINS * int(s)) for s in steps], utc=True)
     hours = fut_timestamps.hour + fut_timestamps.minute / 60.0
-    dows = fut_timestamps.dayofweek
+    dows = fut_timestamps.day_of_week
 
     X_fut = pd.DataFrame({
         "hour_sin": np.sin(2 * np.pi * hours / 24.0),
@@ -204,17 +205,15 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
     classes = list(schedule_model.classes_)
     prob_pos = probs[:, classes.index(1)] if 1 in classes else np.zeros(len(steps))
 
-    # For sparse binary sensors whose peak probability may sit slightly below 0.50,
-    # fall back to an adaptive peak threshold if the schedule never crosses 0.50.
     threshold = 0.50 if prob_pos.max() >= 0.50 else max(0.25, float(prob_pos.max()) * 0.85)
     preds = (prob_pos >= threshold).astype(int)
 
     sim_state = current_state_bin
     for idx, pred in enumerate(preds):
         if sim_state == 0 and pred == 1 and next_on is None:
-            next_on = fut_timestamps[idx].astimezone().isoformat()
+            next_on = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
         elif sim_state == 1 and pred == 0 and next_off is None:
-            next_off = fut_timestamps[idx].astimezone().isoformat()
+            next_off = fut_timestamps[idx].tz_convert(LOCAL_TZ).isoformat()
 
         sim_state = pred
         if next_on and next_off:
@@ -241,7 +240,6 @@ def train_and_predict(conn, entity_item):
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
 
-    # Validate total time span rather than raw state-change count
     span_hours = (now_dt - df["timestamp"].min()).total_seconds() / 3600.0
     if span_hours < MIN_HISTORY_HOURS:
         return "unknown", 0.0, {
@@ -250,7 +248,6 @@ def train_and_predict(conn, entity_item):
             "required_hours": MIN_HISTORY_HOURS,
         }
 
-    # Anchor timeline up to the current timestamp
     now_anchor = pd.DataFrame([{
         "timestamp": now_dt,
         "state": entity_item.get("state"),
@@ -258,11 +255,9 @@ def train_and_predict(conn, entity_item):
     }])
     df = pd.concat([df, now_anchor], ignore_index=True)
 
-    # Track continuous duration in each state
     df["state_change_group"] = (df["state"] != df["state"].shift()).cumsum()
     df["group_start_ts"] = df.groupby("state_change_group")["timestamp"].transform("first")
 
-    # Resample onto a uniform time grid
     resample_rule = f"{RESAMPLE_MINS}min"
     df = df.set_index("timestamp").resample(resample_rule).ffill().dropna(subset=["state"]).reset_index()
     df["attr_dict"] = df["attributes"].apply(json.loads)
@@ -286,19 +281,17 @@ def train_and_predict(conn, entity_item):
     X = train_df[feature_cols]
     y = train_df["future_target"].astype(int)
 
-    # Exponential recency weights so vacations or closed-off rooms adapt quickly
     age_days = (now_dt - train_df["timestamp"]).dt.total_seconds() / 86400.0
     sample_weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
 
-    # 1. Context-aware model (live GPS distance + state duration + time) for short-term state prediction
+    # 1. Context-aware model for short-term state prediction
     model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
     model.fit(X, y, sample_weight=sample_weights)
 
-    # 2. Pure schedule model (time-of-day & day-of-week only) for next_on / next_off forecasting
+    # 2. Pure schedule model for next_on / next_off forecasting
     schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
     schedule_model.fit(train_df[schedule_cols], y, sample_weight=sample_weights)
 
-    # Prepare live observation row
     last_changed_str = entity_item.get("last_changed")
     last_changed_dt = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00")) if last_changed_str else now_dt
     mins_in_state = max(0.0, (now_dt - last_changed_dt).total_seconds() / 60.0)
@@ -331,7 +324,7 @@ def train_and_predict(conn, entity_item):
         "expected_next_off": next_off,
         "mins_in_current_state": round(mins_in_state, 1),
         "recorded_hours": round(span_hours, 1),
-        "last_updated": now_dt.astimezone().isoformat(),
+        "last_updated": now_dt.astimezone(LOCAL_TZ).isoformat(),
     }
 
     if is_person:
