@@ -1,5 +1,4 @@
 import os
-import re
 import math
 import time
 import json
@@ -30,6 +29,7 @@ MQTT_PREFIX = os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant")
 BINARY_SENSOR_PATTERNS = [p.strip() for p in os.getenv("BINARY_SENSOR_PATTERNS", "").split(",") if p.strip()]
 CERTAINTY_THRESHOLD = float(os.getenv("CERTAINTY_THRESHOLD", "0.70"))
 PREDICT_HORIZON_MINS = int(os.getenv("PREDICT_HORIZON_MINS", "30"))
+RESAMPLE_MINS = int(os.getenv("RESAMPLE_MINS", "5"))
 INITIAL_HISTORY_DAYS = int(os.getenv("INITIAL_HISTORY_DAYS", "10"))
 MIN_HISTORY_HOURS = int(os.getenv("MIN_HISTORY_HOURS", "24"))
 DECAY_HALF_LIFE_DAYS = float(os.getenv("DECAY_HALF_LIFE_DAYS", "7.0"))
@@ -167,10 +167,8 @@ def build_features(df, is_person=False):
     df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
     df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
 
-    feature_cols = [
-        "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend",
-        "current_state_bin", "mins_in_current_state",
-    ]
+    schedule_cols = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend"]
+    feature_cols = schedule_cols + ["current_state_bin", "mins_in_current_state"]
 
     if is_person:
         def calc_dist(a):
@@ -180,63 +178,47 @@ def build_features(df, is_person=False):
         df["gps_accuracy"] = df["attr_dict"].apply(lambda a: float(a.get("gps_accuracy", 0) or 0))
         feature_cols.extend(["distance_from_home_km", "gps_accuracy"])
 
-    return df, feature_cols
+    return df, feature_cols, schedule_cols
 
 
-def estimate_next_transitions(model, feature_cols, now_dt, current_row, is_person):
-    """Autoregressively scans up to 7 days in 15-min steps to find expected next ON/OFF times."""
+def estimate_next_transitions(schedule_model, now_dt, current_state_bin):
+    """Vectorized 7-day scan using pure schedule features so frozen GPS/duration cannot lock predictions."""
     next_on = None
     next_off = None
 
-    sim_state_bin = int(current_row["current_state_bin"].iloc[0])
-    sim_mins_in_state = float(current_row["mins_in_current_state"].iloc[0])
-    base_attrs = current_row["attr_dict"].iloc[0]
-
-    # Pre-build timestamps and cyclical calendar features for all 672 steps (7 days) at once
-    steps = np.arange(1, 673)
-    fut_timestamps = pd.to_datetime([now_dt + timedelta(minutes=15 * int(s)) for s in steps], utc=True)
+    total_steps = (7 * 24 * 60) // RESAMPLE_MINS
+    steps = np.arange(1, total_steps + 1)
+    fut_timestamps = pd.to_datetime([now_dt + timedelta(minutes=RESAMPLE_MINS * int(s)) for s in steps], utc=True)
     hours = fut_timestamps.hour + fut_timestamps.minute / 60.0
     dows = fut_timestamps.dayofweek
 
-    hour_sin = np.sin(2 * np.pi * hours / 24.0)
-    hour_cos = np.cos(2 * np.pi * hours / 24.0)
-    dow_sin = np.sin(2 * np.pi * dows / 7.0)
-    dow_cos = np.cos(2 * np.pi * dows / 7.0)
-    is_weekend = (dows >= 5).astype(int)
+    X_fut = pd.DataFrame({
+        "hour_sin": np.sin(2 * np.pi * hours / 24.0),
+        "hour_cos": np.cos(2 * np.pi * hours / 24.0),
+        "dow_sin": np.sin(2 * np.pi * dows / 7.0),
+        "dow_cos": np.cos(2 * np.pi * dows / 7.0),
+        "is_weekend": (dows >= 5).astype(int),
+    })
 
-    if is_person:
-        dist_km = haversine_km(base_attrs.get("latitude"), base_attrs.get("longitude"), HOME_COORDS[0], HOME_COORDS[1])
-        gps_acc = float(base_attrs.get("gps_accuracy", 0) or 0)
+    probs = schedule_model.predict_proba(X_fut)
+    classes = list(schedule_model.classes_)
+    prob_pos = probs[:, classes.index(1)] if 1 in classes else np.zeros(len(steps))
 
-    for idx in range(len(steps)):
-        if is_person:
-            row_vals = [[
-                hour_sin[idx], hour_cos[idx], dow_sin[idx], dow_cos[idx], is_weekend[idx],
-                sim_state_bin, sim_mins_in_state, dist_km, gps_acc,
-            ]]
-        else:
-            row_vals = [[
-                hour_sin[idx], hour_cos[idx], dow_sin[idx], dow_cos[idx], is_weekend[idx],
-                sim_state_bin, sim_mins_in_state,
-            ]]
+    # For sparse binary sensors whose peak probability may sit slightly below 0.50,
+    # fall back to an adaptive peak threshold if the schedule never crosses 0.50.
+    threshold = 0.50 if prob_pos.max() >= 0.50 else max(0.25, float(prob_pos.max()) * 0.85)
+    preds = (prob_pos >= threshold).astype(int)
 
-        X_step = pd.DataFrame(row_vals, columns=feature_cols)
-        pred = int(model.predict(X_step)[0])
-
-        if sim_state_bin == 0 and pred == 1 and next_on is None:
+    sim_state = current_state_bin
+    for idx, pred in enumerate(preds):
+        if sim_state == 0 and pred == 1 and next_on is None:
             next_on = fut_timestamps[idx].astimezone().isoformat()
-        elif sim_state_bin == 1 and pred == 0 and next_off is None:
+        elif sim_state == 1 and pred == 0 and next_off is None:
             next_off = fut_timestamps[idx].astimezone().isoformat()
 
+        sim_state = pred
         if next_on and next_off:
             break
-
-        # Advance simulated state for the next 15-minute step
-        if pred != sim_state_bin:
-            sim_state_bin = pred
-            sim_mins_in_state = 15.0
-        else:
-            sim_mins_in_state += 15.0
 
     return next_on, next_off
 
@@ -259,7 +241,7 @@ def train_and_predict(conn, entity_item):
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
 
-    # Validate total time span instead of raw state-change count
+    # Validate total time span rather than raw state-change count
     span_hours = (now_dt - df["timestamp"].min()).total_seconds() / 3600.0
     if span_hours < MIN_HISTORY_HOURS:
         return "unknown", 0.0, {
@@ -280,13 +262,14 @@ def train_and_predict(conn, entity_item):
     df["state_change_group"] = (df["state"] != df["state"].shift()).cumsum()
     df["group_start_ts"] = df.groupby("state_change_group")["timestamp"].transform("first")
 
-    # Resample onto a 15-minute grid
-    df = df.set_index("timestamp").resample("15min").ffill().dropna(subset=["state"]).reset_index()
+    # Resample onto a uniform time grid
+    resample_rule = f"{RESAMPLE_MINS}min"
+    df = df.set_index("timestamp").resample(resample_rule).ffill().dropna(subset=["state"]).reset_index()
     df["attr_dict"] = df["attributes"].apply(json.loads)
     df["current_state_bin"] = (df["state"] == positive_state).astype(int)
     df["mins_in_current_state"] = (df["timestamp"] - df["group_start_ts"]).dt.total_seconds() / 60.0
 
-    shift_steps = max(1, PREDICT_HORIZON_MINS // 15)
+    shift_steps = max(1, PREDICT_HORIZON_MINS // RESAMPLE_MINS)
     df["future_target"] = df["current_state_bin"].shift(-shift_steps)
     train_df = df.dropna(subset=["future_target"]).copy()
 
@@ -299,7 +282,7 @@ def train_and_predict(conn, entity_item):
             "recorded_hours": round(span_hours, 1),
         }
 
-    train_df, feature_cols = build_features(train_df, is_person=is_person)
+    train_df, feature_cols, schedule_cols = build_features(train_df, is_person=is_person)
     X = train_df[feature_cols]
     y = train_df["future_target"].astype(int)
 
@@ -307,21 +290,27 @@ def train_and_predict(conn, entity_item):
     age_days = (now_dt - train_df["timestamp"]).dt.total_seconds() / 86400.0
     sample_weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
 
+    # 1. Context-aware model (live GPS distance + state duration + time) for short-term state prediction
     model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
     model.fit(X, y, sample_weight=sample_weights)
+
+    # 2. Pure schedule model (time-of-day & day-of-week only) for next_on / next_off forecasting
+    schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
+    schedule_model.fit(train_df[schedule_cols], y, sample_weight=sample_weights)
 
     # Prepare live observation row
     last_changed_str = entity_item.get("last_changed")
     last_changed_dt = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00")) if last_changed_str else now_dt
     mins_in_state = max(0.0, (now_dt - last_changed_dt).total_seconds() / 60.0)
+    curr_bin = 1 if entity_item.get("state") == positive_state else 0
 
     now_df = pd.DataFrame([{
         "timestamp": now_dt,
         "attr_dict": entity_item.get("attributes", {}),
-        "current_state_bin": 1 if entity_item.get("state") == positive_state else 0,
+        "current_state_bin": curr_bin,
         "mins_in_current_state": mins_in_state,
     }])
-    now_df, _ = build_features(now_df, is_person=is_person)
+    now_df, _, _ = build_features(now_df, is_person=is_person)
 
     probs = model.predict_proba(now_df[feature_cols])[0]
     classes = list(model.classes_)
@@ -331,7 +320,7 @@ def train_and_predict(conn, entity_item):
     max_prob = max(prob_pos, prob_neg)
     predicted_state = positive_state if prob_pos >= prob_neg else negative_state
 
-    next_on, next_off = estimate_next_transitions(model, feature_cols, now_dt, now_df, is_person)
+    next_on, next_off = estimate_next_transitions(schedule_model, now_dt, curr_bin)
 
     meta = {
         "probability_active": round(float(prob_pos), 3),
