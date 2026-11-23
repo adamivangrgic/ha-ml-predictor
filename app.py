@@ -5,13 +5,14 @@ import json
 import sqlite3
 import fnmatch
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 import requests
 import numpy as np
 import pandas as pd
 import paho.mqtt.client as mqtt
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ha-ml-predictor")
@@ -43,7 +44,8 @@ EXCLUDE_PATTERNS = [
     if p.strip()
 ]
 
-# Workday / Holiday sensor in Home Assistant (falls back to Mon-Fri if not found)
+# Holiday Calendar (preferred, e.g. "calendar.croatia") & optional Workday binary_sensor fallback
+HOLIDAY_CALENDAR_ENTITY_ID = os.getenv("HOLIDAY_CALENDAR_ENTITY_ID", "").strip()
 WORKDAY_ENTITY_ID = os.getenv("WORKDAY_ENTITY_ID", "binary_sensor.workday_sensor").strip()
 
 CERTAINTY_THRESHOLD = float(os.getenv("CERTAINTY_THRESHOLD", "0.70"))
@@ -58,7 +60,7 @@ INITIAL_HISTORY_DAYS = int(os.getenv("INITIAL_HISTORY_DAYS", "10"))
 CONTEXT_RETENTION_DAYS = int(os.getenv("CONTEXT_RETENTION_DAYS", "14"))
 MIN_HISTORY_HOURS = int(os.getenv("MIN_HISTORY_HOURS", "24"))
 DECAY_HALF_LIFE_DAYS = float(os.getenv("DECAY_HALF_LIFE_DAYS", "7.0"))
-CORRELATION_MIN_STRENGTH = float(os.getenv("CORRELATION_MIN_STRENGTH", "0.35"))
+CORRELATION_MIN_STRENGTH = float(os.getenv("CORRELATION_MIN_STRENGTH", "0.28"))
 CORRELATION_INTERVAL_HOURS = float(os.getenv("CORRELATION_INTERVAL_HOURS", "24.0"))
 DB_PATH = os.getenv("DB_PATH", "/data/history.db")
 
@@ -103,7 +105,6 @@ def state_to_binary(state_str, is_person=False):
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    # Tier 1: Permanent archive for predicted entities + workday sensor
     conn.execute("""
         CREATE TABLE IF NOT EXISTS state_history (
             entity_id TEXT,
@@ -113,7 +114,6 @@ def init_db():
             PRIMARY KEY (entity_id, timestamp)
         )
     """)
-    # Tier 2: Rolling short-term archive for context entities
     conn.execute("""
         CREATE TABLE IF NOT EXISTS context_history (
             entity_id TEXT,
@@ -122,7 +122,6 @@ def init_db():
             PRIMARY KEY (entity_id, timestamp)
         )
     """)
-    # Self-evaluation log for tracking real-world prediction accuracy
     conn.execute("""
         CREATE TABLE IF NOT EXISTS prediction_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,7 +192,6 @@ def archive_states(conn, states_list, is_context=False):
 
 # --- Self-Evaluating Accuracy Tracking ---
 def evaluate_past_predictions(conn):
-    """Grades matured predictions against archived state_history and returns 7d accuracy stats per entity."""
     now_iso = datetime.now(timezone.utc).isoformat()
     pending = conn.execute(
         "SELECT id, entity_id, target_ts, predicted_state FROM prediction_log WHERE actual_state IS NULL AND target_ts <= ?",
@@ -241,7 +239,6 @@ def evaluate_past_predictions(conn):
 
 
 def record_prediction(conn, eid, now_dt, horizon_mins, predicted_state):
-    """Logs non-unknown predictions (throttled to 1 entry per entity every 15 mins to avoid bloat)."""
     if predicted_state == "unknown":
         return
     recent_cutoff = (now_dt - timedelta(minutes=14)).isoformat()
@@ -260,7 +257,7 @@ def record_prediction(conn, eid, now_dt, horizon_mins, predicted_state):
     conn.commit()
 
 
-# --- Home Assistant API ---
+# --- Home Assistant API & Holiday Calendar ---
 def fetch_home_coords():
     global HOME_COORDS
     try:
@@ -270,6 +267,52 @@ def fetch_home_coords():
             HOME_COORDS = (attrs.get("latitude"), attrs.get("longitude"))
     except Exception as e:
         log.warning(f"Could not fetch zone.home coordinates: {e}")
+
+
+def fetch_holiday_calendar_dates(days_back=30, days_forward=14):
+    if not HOLIDAY_CALENDAR_ENTITY_ID:
+        return {}
+
+    now_utc = datetime.now(timezone.utc)
+    start_iso = (now_utc - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00Z")
+    end_iso = (now_utc + timedelta(days=days_forward)).strftime("%Y-%m-%dT23:59:59Z")
+    url = f"{HA_URL}/api/calendars/{HOLIDAY_CALENDAR_ENTITY_ID}"
+
+    holiday_map = {}
+    try:
+        resp = requests.get(url, headers=HEADERS, params={"start": start_iso, "end": end_iso}, timeout=15)
+        if resp.status_code != 200:
+            log.warning(f"Calendar fetch for {HOLIDAY_CALENDAR_ENTITY_ID} returned HTTP {resp.status_code}")
+            return {}
+
+        for ev in resp.json():
+            summary = ev.get("summary", "Holiday")
+            start_obj = ev.get("start", {})
+            end_obj = ev.get("end", {})
+
+            if "date" in start_obj:
+                s_date = date.fromisoformat(start_obj["date"])
+                e_date = date.fromisoformat(end_obj["date"]) if "date" in end_obj else (s_date + timedelta(days=1))
+                curr = s_date
+                while curr < e_date:
+                    holiday_map[curr] = summary
+                    curr += timedelta(days=1)
+            elif "dateTime" in start_obj:
+                s_dt = datetime.fromisoformat(start_obj["dateTime"].replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+                e_dt = (
+                    datetime.fromisoformat(end_obj["dateTime"].replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+                    if "dateTime" in end_obj
+                    else s_dt
+                )
+                curr = s_dt.date()
+                last = e_dt.date()
+                while curr <= last:
+                    holiday_map[curr] = summary
+                    curr += timedelta(days=1)
+    except Exception as e:
+        log.warning(f"Failed fetching holiday calendar {HOLIDAY_CALENDAR_ENTITY_ID}: {e}")
+
+    return holiday_map
 
 
 def is_excluded(eid):
@@ -299,7 +342,7 @@ def get_entities():
 
     for item in all_states:
         eid = item["entity_id"]
-        if eid in target_ids or eid == WORKDAY_ENTITY_ID or is_excluded(eid):
+        if eid in target_ids or eid == WORKDAY_ENTITY_ID or eid.startswith("calendar.") or is_excluded(eid):
             continue
         if any(fnmatch.fnmatch(eid, pat) for pat in CONTEXT_ENTITY_PATTERNS):
             st = str(item.get("state", "")).lower()
@@ -358,9 +401,19 @@ def sync_entity_group(conn, entities, is_context=False):
     conn.commit()
 
 
-def get_workday_series(conn, resample_rule, index_like, live_workday_item):
-    """Builds an aligned binary series (1 = workday, 0 = weekend/holiday) from HA workday sensor or Mon-Fri fallback."""
-    fallback = pd.Series((index_like.day_of_week < 5).astype(int), index=index_like)
+def get_workday_series(conn, resample_rule, index_like, holiday_dates, live_workday_item):
+    """Builds aligned binary series (1 = workday, 0 = weekend/holiday) for any DatetimeIndex."""
+    local_idx = index_like.tz_convert(LOCAL_TZ)
+    base_weekday = (local_idx.day_of_week < 5).astype(int)
+
+    if HOLIDAY_CALENDAR_ENTITY_ID:
+        if not holiday_dates:
+            return pd.Series(base_weekday, index=index_like)
+        is_hol = np.array([1 if ts.date() in holiday_dates else 0 for ts in local_idx])
+        workdays = np.where((base_weekday == 1) & (is_hol == 0), 1, 0)
+        return pd.Series(workdays, index=index_like, dtype=int)
+
+    fallback = pd.Series(base_weekday, index=index_like)
     if not WORKDAY_ENTITY_ID:
         return fallback
 
@@ -383,9 +436,23 @@ def get_workday_series(conn, resample_rule, index_like, live_workday_item):
     return s_res.reindex(index_like, method="ffill").fillna(fallback).astype(int)
 
 
-# --- Nightly Cross-Sensor Lagged Correlation Engine ---
+def is_date_workday(target_date, holiday_dates, live_workday_item=None, is_today=False):
+    if target_date.weekday() >= 5:
+        return 0
+    if HOLIDAY_CALENDAR_ENTITY_ID:
+        return 0 if target_date in holiday_dates else 1
+    if is_today and live_workday_item and live_workday_item.get("state") in ("on", "off"):
+        return 1 if live_workday_item.get("state") == "on" else 0
+    return 1
+
+
+# --- Nightly Time-Deconfounded Cross-Sensor Correlation Engine (#5) ---
 def run_correlation_analysis(conn, all_entity_map):
-    log.info("Running cross-sensor lagged correlation analysis...")
+    """
+    Computes partial/de-confounded lagged correlations by subtracting each entity's
+    hourly baseline before correlating, eliminating spurious time-of-day coincidences.
+    """
+    log.info("Running time-deconfounded cross-sensor correlation analysis...")
     now_dt = datetime.now(timezone.utc)
     cutoff_str = (now_dt - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
 
@@ -424,6 +491,10 @@ def run_correlation_analysis(conn, all_entity_map):
     if len(grid) < 48:
         return {}, []
 
+    # Subtract each entity's hourly mean (local time) so correlations reflect genuine event co-occurrence
+    local_hours = grid.index.tz_convert(LOCAL_TZ).hour
+    residuals = grid - grid.groupby(local_hours).transform("mean")
+
     target_eids = [
         eid for eid in grid.columns
         if eid.startswith("person.") or any(fnmatch.fnmatch(eid, pat) for pat in BINARY_SENSOR_PATTERNS)
@@ -437,10 +508,10 @@ def run_correlation_analysis(conn, all_entity_map):
         return all_entity_map.get(eid, {}).get("attributes", {}).get("friendly_name", eid)
 
     for target in target_eids:
-        target_series = grid[target]
+        target_res = residuals[target]
         candidates = []
 
-        for driver in grid.columns:
+        for driver in residuals.columns:
             if driver == target:
                 continue
 
@@ -449,9 +520,9 @@ def run_correlation_analysis(conn, all_entity_map):
 
             for lag_m in lags_mins:
                 shift_steps = lag_m // RESAMPLE_MINS
-                shifted_driver = grid[driver].shift(shift_steps) if shift_steps > 0 else grid[driver]
-                valid = pd.concat([target_series, shifted_driver], axis=1).dropna()
-                if len(valid) < 48 or valid.iloc[:, 1].nunique() < 2:
+                shifted_driver = residuals[driver].shift(shift_steps) if shift_steps > 0 else residuals[driver]
+                valid = pd.concat([target_res, shifted_driver], axis=1).dropna()
+                if len(valid) < 48 or valid.iloc[:, 1].std() < 1e-6 or valid.iloc[:, 0].std() < 1e-6:
                     continue
                 r = float(valid.iloc[:, 0].corr(valid.iloc[:, 1]))
                 if not math.isnan(r) and abs(r) > abs(best_corr):
@@ -497,7 +568,7 @@ def run_correlation_analysis(conn, all_entity_map):
         if len(top_insights) >= 15:
             break
 
-    log.info(f"Correlation analysis complete: found {len(top_insights)} strong rules across {len(grid.columns)} entities.")
+    log.info(f"De-confounded correlation analysis complete: found {len(top_insights)} strong rules across {len(grid.columns)} entities.")
     return driver_map, top_insights
 
 
@@ -530,22 +601,62 @@ def get_driver_history_series(conn, driver_eid, lag_mins, resample_rule, index_l
     return s_res.reindex(index_like, method="ffill").fillna(0).astype(int)
 
 
-# --- Feature Engineering & ML ---
+# --- Feature Engineering & Calibrated HGB Classifier (#1, #2, #3, #6) ---
+def compute_fourier_time_df(timestamps_utc):
+    """Multi-harmonic (24h, 12h, 8h) cyclical time features for sharp transition timing (#2)."""
+    local_ts = timestamps_utc.tz_convert(LOCAL_TZ)
+    hours = local_ts.hour + local_ts.minute / 60.0
+    dows = local_ts.day_of_week
+    angle = 2.0 * np.pi * hours / 24.0
+
+    return pd.DataFrame({
+        "hour_sin": np.sin(angle),
+        "hour_cos": np.cos(angle),
+        "hour_sin2": np.sin(2.0 * angle),
+        "hour_cos2": np.cos(2.0 * angle),
+        "hour_sin3": np.sin(3.0 * angle),
+        "hour_cos3": np.cos(3.0 * angle),
+        "dow_sin": np.sin(2.0 * np.pi * dows / 7.0),
+        "dow_cos": np.cos(2.0 * np.pi * dows / 7.0),
+        "is_weekend": (dows >= 5).astype(int),
+    })
+
+
 def build_features(df, is_person=False, driver_cols=None):
     df = df.copy()
-    df["hour"] = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
-    df["dow"] = df["timestamp"].dt.day_of_week
-    df["is_weekend"] = (df["dow"] >= 5).astype(int)
+    time_feats = compute_fourier_time_df(pd.DatetimeIndex(df["timestamp"]))
+    for col in time_feats.columns:
+        df[col] = time_feats[col].values
+
     if "is_workday" not in df.columns:
-        df["is_workday"] = (df["dow"] < 5).astype(int)
+        df["is_workday"] = (df["is_weekend"] == 0).astype(int)
+    if "is_tomorrow_workday" not in df.columns:
+        df["is_tomorrow_workday"] = df["is_workday"]
 
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
-    df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
-    df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
+    # Rolling activity momentum features (#3)
+    steps_30m = max(1, 30 // RESAMPLE_MINS)
+    steps_1h = max(1, 60 // RESAMPLE_MINS)
+    steps_2h = max(1, 120 // RESAMPLE_MINS)
 
-    schedule_cols = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_weekend", "is_workday"]
-    feature_cols = schedule_cols + ["current_state_bin", "mins_in_current_state"]
+    if "active_ratio_30m" not in df.columns:
+        df["active_ratio_30m"] = df["current_state_bin"].rolling(steps_30m, min_periods=1).mean()
+    if "active_ratio_2h" not in df.columns:
+        df["active_ratio_2h"] = df["current_state_bin"].rolling(steps_2h, min_periods=1).mean()
+    if "transitions_1h" not in df.columns:
+        flips = (df["current_state_bin"].diff().abs() > 0).astype(int)
+        df["transitions_1h"] = flips.rolling(steps_1h, min_periods=1).sum()
+
+    schedule_cols = [
+        "hour_sin", "hour_cos", "hour_sin2", "hour_cos2", "hour_sin3", "hour_cos3",
+        "dow_sin", "dow_cos", "is_weekend", "is_workday", "is_tomorrow_workday",
+    ]
+    feature_cols = schedule_cols + [
+        "current_state_bin",
+        "mins_in_current_state",
+        "active_ratio_30m",
+        "active_ratio_2h",
+        "transitions_1h",
+    ]
 
     if is_person:
         def calc_dist(a):
@@ -585,25 +696,51 @@ def build_features(df, is_person=False, driver_cols=None):
     return df, feature_cols, schedule_cols
 
 
-def build_24h_ascii_timeline(schedule_model, now_dt, threshold, is_workday_today, is_workday_tomorrow):
-    """Generates a 48-char (30-min/char) high-contrast ASCII timeline respecting today/tomorrow workday status."""
+def fit_calibrated_hgb(X, y, sample_weight, max_depth=6):
+    """Fits HistGradientBoostingClassifier with sigmoid probability calibration when enough samples exist (#1)."""
+    base_clf = HistGradientBoostingClassifier(
+        max_iter=120,
+        learning_rate=0.06,
+        max_depth=max_depth,
+        min_samples_leaf=15,
+        l2_regularization=1.0,
+        random_state=42,
+    )
+    min_class_count = int(y.value_counts().min())
+    if min_class_count >= 12 and len(y) >= 60:
+        cal_clf = CalibratedClassifierCV(base_clf, method="sigmoid", cv=3)
+        cal_clf.fit(X, y, sample_weight=sample_weight)
+        return cal_clf
+
+    base_clf.fit(X, y, sample_weight=sample_weight)
+    return base_clf
+
+
+def build_schedule_design_matrix(timestamps_utc, holiday_dates, live_workday_item):
+    """Builds schedule feature matrix including is_workday and is_tomorrow_workday (#6)."""
+    local_ts = timestamps_utc.tz_convert(LOCAL_TZ)
+    today_date = datetime.now(timezone.utc).astimezone(LOCAL_TZ).date()
+
+    X = compute_fourier_time_df(timestamps_utc)
+    workdays = []
+    tomorrow_workdays = []
+
+    for ts in local_ts:
+        d_curr = ts.date()
+        d_next = d_curr + timedelta(days=1)
+        workdays.append(is_date_workday(d_curr, holiday_dates, live_workday_item, is_today=(d_curr == today_date)))
+        tomorrow_workdays.append(is_date_workday(d_next, holiday_dates, live_workday_item, is_today=(d_next == today_date)))
+
+    X["is_workday"] = np.array(workdays, dtype=int)
+    X["is_tomorrow_workday"] = np.array(tomorrow_workdays, dtype=int)
+    return X
+
+
+def build_24h_ascii_timeline(schedule_model, now_dt, threshold, holiday_dates, live_workday_item):
+    """Generates a 48-char (30-min/char) high-contrast ASCII timeline respecting holidays and holiday-eves."""
     slot_offsets = np.arange(48) * 30 + 15
-    slot_timestamps = pd.to_datetime([now_dt + timedelta(minutes=int(m)) for m in slot_offsets], utc=True)
-    local_slots = slot_timestamps.tz_convert(LOCAL_TZ)
-    today_date = now_dt.astimezone(LOCAL_TZ).date()
-
-    hours = slot_timestamps.hour + slot_timestamps.minute / 60.0
-    dows = slot_timestamps.day_of_week
-    workdays = np.array([is_workday_today if ts.date() == today_date else is_workday_tomorrow for ts in local_slots])
-
-    X_slots = pd.DataFrame({
-        "hour_sin": np.sin(2 * np.pi * hours / 24.0),
-        "hour_cos": np.cos(2 * np.pi * hours / 24.0),
-        "dow_sin": np.sin(2 * np.pi * dows / 7.0),
-        "dow_cos": np.cos(2 * np.pi * dows / 7.0),
-        "is_weekend": (dows >= 5).astype(int),
-        "is_workday": workdays,
-    })
+    slot_timestamps = pd.DatetimeIndex([now_dt + timedelta(minutes=int(m)) for m in slot_offsets], tz="UTC")
+    X_slots = build_schedule_design_matrix(slot_timestamps, holiday_dates, live_workday_item)
 
     probs = schedule_model.predict_proba(X_slots)
     classes = list(schedule_model.classes_)
@@ -618,40 +755,17 @@ def build_24h_ascii_timeline(schedule_model, now_dt, threshold, is_workday_today
     return "".join(chars)
 
 
-def estimate_next_transitions(schedule_model, now_dt, current_state_bin, is_workday_today, is_workday_tomorrow):
-    """Vectorized 7-day scan using schedule + workday awareness + 24h ASCII timeline builder."""
+def estimate_next_transitions(schedule_model, now_dt, current_state_bin, holiday_dates, live_workday_item):
+    """Vectorized 7-day scan using calibrated schedule model + holiday/holiday-eve awareness."""
     next_on = None
     next_off = None
 
     total_steps = (7 * 24 * 60) // RESAMPLE_MINS
     steps = np.arange(1, total_steps + 1)
-    fut_timestamps = pd.to_datetime([now_dt + timedelta(minutes=RESAMPLE_MINS * int(s)) for s in steps], utc=True)
+    fut_timestamps = pd.DatetimeIndex([now_dt + timedelta(minutes=RESAMPLE_MINS * int(s)) for s in steps], tz="UTC")
     local_fut = fut_timestamps.tz_convert(LOCAL_TZ)
-    today_date = now_dt.astimezone(LOCAL_TZ).date()
-    tomorrow_date = today_date + timedelta(days=1)
 
-    hours = fut_timestamps.hour + fut_timestamps.minute / 60.0
-    dows = fut_timestamps.day_of_week
-
-    workdays = []
-    for ts, d in zip(local_fut, dows):
-        dt_date = ts.date()
-        if dt_date == today_date:
-            workdays.append(is_workday_today)
-        elif dt_date == tomorrow_date:
-            workdays.append(is_workday_tomorrow)
-        else:
-            workdays.append(1 if d < 5 else 0)
-
-    X_fut = pd.DataFrame({
-        "hour_sin": np.sin(2 * np.pi * hours / 24.0),
-        "hour_cos": np.cos(2 * np.pi * hours / 24.0),
-        "dow_sin": np.sin(2 * np.pi * dows / 7.0),
-        "dow_cos": np.cos(2 * np.pi * dows / 7.0),
-        "is_weekend": (dows >= 5).astype(int),
-        "is_workday": np.array(workdays, dtype=int),
-    })
-
+    X_fut = build_schedule_design_matrix(fut_timestamps, holiday_dates, live_workday_item)
     probs = schedule_model.predict_proba(X_fut)
     classes = list(schedule_model.classes_)
     prob_pos = probs[:, classes.index(1)] if 1 in classes else np.zeros(len(steps))
@@ -670,11 +784,11 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin, is_work
         if next_on and next_off:
             break
 
-    timeline_24h = build_24h_ascii_timeline(schedule_model, now_dt, threshold, is_workday_today, is_workday_tomorrow)
+    timeline_24h = build_24h_ascii_timeline(schedule_model, now_dt, threshold, holiday_dates, live_workday_item)
     return next_on, next_off, timeline_24h
 
 
-def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, acc_stats):
+def train_and_predict(conn, entity_item, drivers, all_entity_map, holiday_dates, workday_item, acc_stats):
     eid = entity_item["entity_id"]
     is_person = eid.startswith("person.")
     positive_state = "home" if is_person else "on"
@@ -713,9 +827,13 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
     resample_rule = f"{RESAMPLE_MINS}min"
     df_indexed = df.set_index("timestamp").resample(resample_rule).ffill().dropna(subset=["state"])
 
-    # Attach workday/holiday flag series
-    s_workday = get_workday_series(conn, resample_rule, df_indexed.index, workday_item)
+    # Attach workday/holiday flag series for both today and tomorrow (#6)
+    s_workday = get_workday_series(conn, resample_rule, df_indexed.index, holiday_dates, workday_item)
     df_indexed["is_workday"] = s_workday.values
+
+    next_day_index = df_indexed.index + pd.Timedelta(days=1)
+    s_tomorrow_workday = get_workday_series(conn, resample_rule, next_day_index, holiday_dates, workday_item)
+    df_indexed["is_tomorrow_workday"] = s_tomorrow_workday.values
 
     # Attach correlated driver history columns
     driver_cols = []
@@ -739,14 +857,14 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
     df["current_state_bin"] = (df["state"] == positive_state).astype(int)
     df["mins_in_current_state"] = (df["timestamp"] - df["group_start_ts"]).dt.total_seconds() / 60.0
 
-    # Determine today's and tomorrow's workday status
     local_now = now_dt.astimezone(LOCAL_TZ)
-    if workday_item and workday_item.get("state") in ("on", "off"):
-        is_workday_today = 1 if workday_item.get("state") == "on" else 0
-    else:
-        is_workday_today = 1 if local_now.weekday() < 5 else 0
-    tomorrow_dow = (local_now + timedelta(days=1)).weekday()
-    is_workday_tomorrow = 1 if tomorrow_dow < 5 else 0
+    today_date = local_now.date()
+    tomorrow_date = today_date + timedelta(days=1)
+
+    is_workday_today = is_date_workday(today_date, holiday_dates, workday_item, is_today=True)
+    is_workday_tomorrow = is_date_workday(tomorrow_date, holiday_dates, workday_item, is_today=False)
+    holiday_today_name = holiday_dates.get(today_date)
+    holiday_tomorrow_name = holiday_dates.get(tomorrow_date)
 
     # Check if constant historical state
     primary_shift = max(1, PREDICT_HORIZON_MINS // RESAMPLE_MINS)
@@ -765,13 +883,16 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
             "timeline_start": local_now.strftime("%H:%M"),
             "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
             "is_workday": bool(is_workday_today),
+            "is_tomorrow_workday": bool(is_workday_tomorrow),
+            "holiday_today": holiday_today_name,
+            "holiday_tomorrow": holiday_tomorrow_name,
             "correlated_triggers": [d["summary"] for d in drivers],
             "recorded_hours": round(span_hours, 1),
         }
 
     base_df, feature_cols, schedule_cols = build_features(df, is_person=is_person, driver_cols=driver_cols)
 
-    # Prepare live observation row
+    # Prepare live observation row (pulling live rolling momentum from the end of base_df)
     last_changed_str = entity_item.get("last_changed")
     last_changed_dt = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00")) if last_changed_str else now_dt
     mins_in_state = max(0.0, (now_dt - last_changed_dt).total_seconds() / 60.0)
@@ -784,6 +905,10 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
         "current_state_bin": curr_bin,
         "mins_in_current_state": mins_in_state,
         "is_workday": is_workday_today,
+        "is_tomorrow_workday": is_workday_tomorrow,
+        "active_ratio_30m": float(base_df["active_ratio_30m"].iloc[-1]),
+        "active_ratio_2h": float(base_df["active_ratio_2h"].iloc[-1]),
+        "transitions_1h": float(base_df["transitions_1h"].iloc[-1]),
         **live_driver_vals,
     }
 
@@ -805,7 +930,7 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
     now_df = pd.DataFrame([live_row])
     now_df, _, _ = build_features(now_df, is_person=is_person, driver_cols=driver_cols)
 
-    # --- Train Multi-Horizon Models ---
+    # --- Train Calibrated Multi-Horizon HGB Models ---
     all_horizons = sorted(set([PREDICT_HORIZON_MINS] + EXTRA_HORIZONS_MINS))
     horizon_probs = {}
     primary_train_df = None
@@ -826,8 +951,7 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
         age_days = (now_dt - h_train["timestamp"]).dt.total_seconds() / 86400.0
         weights = np.exp(-np.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
 
-        clf = RandomForestClassifier(n_estimators=80, max_depth=8, random_state=42)
-        clf.fit(h_train[feature_cols], h_y, sample_weight=weights)
+        clf = fit_calibrated_hgb(h_train[feature_cols], h_y, weights, max_depth=6)
 
         p_arr = clf.predict_proba(now_df[feature_cols])[0]
         cls_list = list(clf.classes_)
@@ -846,10 +970,9 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
 
     # Pure schedule model for next_on / next_off & 24h timeline
     if primary_train_df is not None and primary_y is not None and primary_weights is not None:
-        schedule_model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-        schedule_model.fit(primary_train_df[schedule_cols], primary_y, sample_weight=primary_weights)
+        schedule_model = fit_calibrated_hgb(primary_train_df[schedule_cols], primary_y, primary_weights, max_depth=5)
         next_on, next_off, timeline_24h = estimate_next_transitions(
-            schedule_model, now_dt, curr_bin, is_workday_today, is_workday_tomorrow
+            schedule_model, now_dt, curr_bin, holiday_dates, workday_item
         )
     else:
         next_on, next_off, timeline_24h = None, None, None
@@ -876,6 +999,12 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, workday_item, 
         "timeline_start": local_now.strftime("%H:%M"),
         "timeline_legend": f"█={positive_state} ·={negative_state} |=6h (30m/char)",
         "is_workday": bool(is_workday_today),
+        "is_tomorrow_workday": bool(is_workday_tomorrow),
+        "holiday_today": holiday_today_name,
+        "holiday_tomorrow": holiday_tomorrow_name,
+        "active_ratio_30m": round(float(live_row["active_ratio_30m"]), 2),
+        "active_ratio_2h": round(float(live_row["active_ratio_2h"]), 2),
+        "transitions_1h": int(live_row["transitions_1h"]),
         "accuracy_7d": acc_7d,
         "evaluated_predictions_7d": eval_count_7d,
         "correlated_triggers": [d["summary"] for d in drivers],
@@ -932,7 +1061,7 @@ def publish_ha_discovery(client, entity_item, state, attributes):
             "identifiers": ["ha_ml_predictor_service"],
             "name": "HA ML Predictor",
             "manufacturer": "Custom ML Service",
-            "model": "RandomForest State Forecaster",
+            "model": "Calibrated HGB State Forecaster",
         },
     }
 
@@ -941,7 +1070,7 @@ def publish_ha_discovery(client, entity_item, state, attributes):
     client.publish(attr_topic, json.dumps(attributes), retain=True)
 
 
-def publish_insights_sensor(client, insights, context_entities, acc_stats):
+def publish_insights_sensor(client, insights, context_entities, acc_stats, holiday_dates):
     unique_id = "ha_ml_behavioral_insights"
     base_topic = f"{MQTT_PREFIX}/sensor/{unique_id}"
     discovery_payload = {
@@ -955,7 +1084,7 @@ def publish_insights_sensor(client, insights, context_entities, acc_stats):
             "identifiers": ["ha_ml_predictor_service"],
             "name": "HA ML Predictor",
             "manufacturer": "Custom ML Service",
-            "model": "RandomForest State Forecaster",
+            "model": "Calibrated HGB State Forecaster",
         },
     }
     overall_acc = None
@@ -963,6 +1092,10 @@ def publish_insights_sensor(client, insights, context_entities, acc_stats):
         overall_acc = round(float(np.mean([v["accuracy_7d"] for v in acc_stats.values()])), 3)
 
     context_ids = sorted([e["entity_id"] for e in context_entities])
+    today_date = datetime.now(timezone.utc).astimezone(LOCAL_TZ).date()
+    upcoming_holidays = {
+        d.isoformat(): name for d, name in sorted(holiday_dates.items()) if d >= today_date
+    }
 
     attrs = {
         "insights": insights,
@@ -970,6 +1103,8 @@ def publish_insights_sensor(client, insights, context_entities, acc_stats):
         "entity_accuracy_7d": acc_stats,
         "context_entities_monitored": len(context_ids),
         "context_entities": context_ids,
+        "holiday_calendar": HOLIDAY_CALENDAR_ENTITY_ID or None,
+        "upcoming_holidays": upcoming_holidays,
         "min_correlation_threshold": CORRELATION_MIN_STRENGTH,
         "last_analyzed": datetime.now(timezone.utc).astimezone(LOCAL_TZ).isoformat(),
     }
@@ -991,6 +1126,7 @@ def main():
     last_corr_run = None
     driver_map = {}
     top_insights = []
+    holiday_dates = {}
 
     while True:
         try:
@@ -1005,16 +1141,19 @@ def main():
             now_utc = datetime.now(timezone.utc)
             if last_corr_run is None or (now_utc - last_corr_run).total_seconds() >= CORRELATION_INTERVAL_HOURS * 3600:
                 prune_old_records(conn)
+                holiday_dates = fetch_holiday_calendar_dates(days_back=max(30, INITIAL_HISTORY_DAYS), days_forward=14)
+                if HOLIDAY_CALENDAR_ENTITY_ID:
+                    log.info(f"Loaded {len(holiday_dates)} holiday dates from {HOLIDAY_CALENDAR_ENTITY_ID}.")
                 driver_map, top_insights = run_correlation_analysis(conn, all_entity_map)
                 last_corr_run = now_utc
 
-            publish_insights_sensor(mqtt_client, top_insights, context_entities, acc_stats)
+            publish_insights_sensor(mqtt_client, top_insights, context_entities, acc_stats, holiday_dates)
 
             for item in targets:
                 eid = item["entity_id"]
                 drivers = driver_map.get(eid, [])
                 pred_state, cert, meta = train_and_predict(
-                    conn, item, drivers, all_entity_map, workday_item, acc_stats
+                    conn, item, drivers, all_entity_map, holiday_dates, workday_item, acc_stats
                 )
                 publish_ha_discovery(mqtt_client, item, pred_state, meta)
                 log.info(
