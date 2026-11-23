@@ -941,7 +941,7 @@ def publish_ha_discovery(client, entity_item, state, attributes):
     client.publish(attr_topic, json.dumps(attributes), retain=True)
 
 
-def publish_insights_sensor(client, insights, context_count, acc_stats):
+def publish_insights_sensor(client, insights, context_entities, acc_stats):
     unique_id = "ha_ml_behavioral_insights"
     base_topic = f"{MQTT_PREFIX}/sensor/{unique_id}"
     discovery_payload = {
@@ -962,11 +962,14 @@ def publish_insights_sensor(client, insights, context_count, acc_stats):
     if acc_stats:
         overall_acc = round(float(np.mean([v["accuracy_7d"] for v in acc_stats.values()])), 3)
 
+    context_ids = sorted([e["entity_id"] for e in context_entities])
+
     attrs = {
         "insights": insights,
         "overall_accuracy_7d": overall_acc,
         "entity_accuracy_7d": acc_stats,
-        "context_entities_monitored": context_count,
+        "context_entities_monitored": len(context_ids),
+        "context_entities": context_ids,
         "min_correlation_threshold": CORRELATION_MIN_STRENGTH,
         "last_analyzed": datetime.now(timezone.utc).astimezone(LOCAL_TZ).isoformat(),
     }
@@ -1005,7 +1008,7 @@ def main():
                 driver_map, top_insights = run_correlation_analysis(conn, all_entity_map)
                 last_corr_run = now_utc
 
-            publish_insights_sensor(mqtt_client, top_insights, len(context_entities), acc_stats)
+            publish_insights_sensor(mqtt_client, top_insights, context_entities, acc_stats)
 
             for item in targets:
                 eid = item["entity_id"]
