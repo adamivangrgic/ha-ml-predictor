@@ -162,7 +162,7 @@ HOUSEHOLD_EID = "household.everyone_home"
 SCHEDULE_COLS = [
     "hour_sin", "hour_cos", "hour_sin2", "hour_cos2", "hour_sin3", "hour_cos3",
     "dow_sin", "dow_cos", "is_weekend", "is_workday", "is_tomorrow_workday",
-    "sun_elev", "sun_rising",
+    "sun_elev", "sun_rising", "hour_frac",
 ]
 
 MODEL_CACHE = {}
@@ -1167,6 +1167,7 @@ def compute_fourier_time_df(timestamps_utc):
         "is_weekend": (dows >= 5).astype(int),
         "sun_elev": elev,
         "sun_rising": rising,
+        "hour_frac": hours,
     })
 
 
@@ -1462,7 +1463,7 @@ def fit_entity_models(base_df, feature_cols, driver_cols, schedule_cols, all_hor
             yq = np.clip(y_t[ok], 0.0, 1440.0)
             for q in QUANTILES:
                 reg = HistGradientBoostingRegressor(
-                    loss="quantile", quantile=q, max_iter=80, learning_rate=0.08, max_depth=5,
+                    loss="quantile", quantile=q, max_iter=150, learning_rate=0.1, max_depth=6,
                     min_samples_leaf=20, l2_regularization=1.0, random_state=42,
                 )
                 reg.fit(Xq, yq, sample_weight=weights_all[ok])
