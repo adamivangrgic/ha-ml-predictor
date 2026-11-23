@@ -11,7 +11,7 @@ import requests
 import numpy as np
 import pandas as pd
 import paho.mqtt.client as mqtt
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -402,7 +402,6 @@ def sync_entity_group(conn, entities, is_context=False):
 
 
 def get_workday_series(conn, resample_rule, index_like, holiday_dates, live_workday_item):
-    """Builds aligned binary series (1 = workday, 0 = weekend/holiday) for any DatetimeIndex."""
     local_idx = index_like.tz_convert(LOCAL_TZ)
     base_weekday = (local_idx.day_of_week < 5).astype(int)
 
@@ -446,12 +445,8 @@ def is_date_workday(target_date, holiday_dates, live_workday_item=None, is_today
     return 1
 
 
-# --- Nightly Time-Deconfounded Cross-Sensor Correlation Engine (#5) ---
+# --- Nightly Time-Deconfounded Cross-Sensor Correlation Engine ---
 def run_correlation_analysis(conn, all_entity_map):
-    """
-    Computes partial/de-confounded lagged correlations by subtracting each entity's
-    hourly baseline before correlating, eliminating spurious time-of-day coincidences.
-    """
     log.info("Running time-deconfounded cross-sensor correlation analysis...")
     now_dt = datetime.now(timezone.utc)
     cutoff_str = (now_dt - timedelta(days=CONTEXT_RETENTION_DAYS)).isoformat()
@@ -491,7 +486,6 @@ def run_correlation_analysis(conn, all_entity_map):
     if len(grid) < 48:
         return {}, []
 
-    # Subtract each entity's hourly mean (local time) so correlations reflect genuine event co-occurrence
     local_hours = grid.index.tz_convert(LOCAL_TZ).hour
     residuals = grid - grid.groupby(local_hours).transform("mean")
 
@@ -601,9 +595,9 @@ def get_driver_history_series(conn, driver_eid, lag_mins, resample_rule, index_l
     return s_res.reindex(index_like, method="ffill").fillna(0).astype(int)
 
 
-# --- Feature Engineering & Calibrated HGB Classifier (#1, #2, #3, #6) ---
+# --- Feature Engineering & Models ---
 def compute_fourier_time_df(timestamps_utc):
-    """Multi-harmonic (24h, 12h, 8h) cyclical time features for sharp transition timing (#2)."""
+    """Multi-harmonic (24h, 12h, 8h) cyclical time features for sharp transition timing."""
     local_ts = timestamps_utc.tz_convert(LOCAL_TZ)
     hours = local_ts.hour + local_ts.minute / 60.0
     dows = local_ts.day_of_week
@@ -633,7 +627,6 @@ def build_features(df, is_person=False, driver_cols=None):
     if "is_tomorrow_workday" not in df.columns:
         df["is_tomorrow_workday"] = df["is_workday"]
 
-    # Rolling activity momentum features (#3)
     steps_30m = max(1, 30 // RESAMPLE_MINS)
     steps_1h = max(1, 60 // RESAMPLE_MINS)
     steps_2h = max(1, 120 // RESAMPLE_MINS)
@@ -697,7 +690,7 @@ def build_features(df, is_person=False, driver_cols=None):
 
 
 def fit_calibrated_hgb(X, y, sample_weight, max_depth=6):
-    """Fits HistGradientBoostingClassifier with sigmoid probability calibration when enough samples exist (#1)."""
+    """Fits HistGradientBoostingClassifier with sigmoid probability calibration for horizon forecasts."""
     base_clf = HistGradientBoostingClassifier(
         max_iter=120,
         learning_rate=0.06,
@@ -717,7 +710,7 @@ def fit_calibrated_hgb(X, y, sample_weight, max_depth=6):
 
 
 def build_schedule_design_matrix(timestamps_utc, holiday_dates, live_workday_item):
-    """Builds schedule feature matrix including is_workday and is_tomorrow_workday (#6)."""
+    """Builds schedule feature matrix including is_workday and is_tomorrow_workday."""
     local_ts = timestamps_utc.tz_convert(LOCAL_TZ)
     today_date = datetime.now(timezone.utc).astimezone(LOCAL_TZ).date()
 
@@ -734,6 +727,23 @@ def build_schedule_design_matrix(timestamps_utc, holiday_dates, live_workday_ite
     X["is_workday"] = np.array(workdays, dtype=int)
     X["is_tomorrow_workday"] = np.array(tomorrow_workdays, dtype=int)
     return X
+
+
+def compute_schedule_threshold(prob_pos):
+    """
+    Computes a dynamic threshold from the schedule probability curve so both
+    low-duty-cycle sensors (e.g. active 2h/day) and high-duty-cycle entities
+    (e.g. home 18h/day) produce clear ON/OFF transitions.
+    """
+    p_min = float(np.min(prob_pos))
+    p_max = float(np.max(prob_pos))
+    if (p_max - p_min) < 0.12:
+        return 0.50
+
+    p15 = float(np.percentile(prob_pos, 15))
+    p85 = float(np.percentile(prob_pos, 85))
+    midpoint = 0.5 * (p15 + p85)
+    return float(np.clip(midpoint, 0.15, 0.85))
 
 
 def build_24h_ascii_timeline(schedule_model, now_dt, threshold, holiday_dates, live_workday_item):
@@ -756,7 +766,7 @@ def build_24h_ascii_timeline(schedule_model, now_dt, threshold, holiday_dates, l
 
 
 def estimate_next_transitions(schedule_model, now_dt, current_state_bin, holiday_dates, live_workday_item):
-    """Vectorized 7-day scan using calibrated schedule model + holiday/holiday-eve awareness."""
+    """Vectorized 7-day scan using unshifted schedule probabilities + dynamic curve threshold."""
     next_on = None
     next_off = None
 
@@ -770,7 +780,7 @@ def estimate_next_transitions(schedule_model, now_dt, current_state_bin, holiday
     classes = list(schedule_model.classes_)
     prob_pos = probs[:, classes.index(1)] if 1 in classes else np.zeros(len(steps))
 
-    threshold = 0.50 if prob_pos.max() >= 0.50 else max(0.25, float(prob_pos.max()) * 0.85)
+    threshold = compute_schedule_threshold(prob_pos)
     preds = (prob_pos >= threshold).astype(int)
 
     sim_state = current_state_bin
@@ -827,7 +837,7 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, holiday_dates,
     resample_rule = f"{RESAMPLE_MINS}min"
     df_indexed = df.set_index("timestamp").resample(resample_rule).ffill().dropna(subset=["state"])
 
-    # Attach workday/holiday flag series for both today and tomorrow (#6)
+    # Attach workday/holiday flag series for both today and tomorrow
     s_workday = get_workday_series(conn, resample_rule, df_indexed.index, holiday_dates, workday_item)
     df_indexed["is_workday"] = s_workday.values
 
@@ -892,7 +902,7 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, holiday_dates,
 
     base_df, feature_cols, schedule_cols = build_features(df, is_person=is_person, driver_cols=driver_cols)
 
-    # Prepare live observation row (pulling live rolling momentum from the end of base_df)
+    # Prepare live observation row
     last_changed_str = entity_item.get("last_changed")
     last_changed_dt = datetime.fromisoformat(last_changed_str.replace("Z", "+00:00")) if last_changed_str else now_dt
     mins_in_state = max(0.0, (now_dt - last_changed_dt).total_seconds() / 60.0)
@@ -933,9 +943,6 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, holiday_dates,
     # --- Train Calibrated Multi-Horizon HGB Models ---
     all_horizons = sorted(set([PREDICT_HORIZON_MINS] + EXTRA_HORIZONS_MINS))
     horizon_probs = {}
-    primary_train_df = None
-    primary_y = None
-    primary_weights = None
 
     for h_mins in all_horizons:
         h_steps = max(1, h_mins // RESAMPLE_MINS)
@@ -958,19 +965,24 @@ def train_and_predict(conn, entity_item, drivers, all_entity_map, holiday_dates,
         p_pos = p_arr[cls_list.index(1)] if 1 in cls_list else 0.0
         horizon_probs[h_mins] = round(float(p_pos), 3)
 
-        if h_mins == PREDICT_HORIZON_MINS:
-            primary_train_df = h_train
-            primary_y = h_y
-            primary_weights = weights
-
     prob_pos = horizon_probs.get(PREDICT_HORIZON_MINS, 0.0)
     prob_neg = 1.0 - prob_pos
     max_prob = max(prob_pos, prob_neg)
     predicted_state = positive_state if prob_pos >= prob_neg else negative_state
 
-    # Pure schedule model for next_on / next_off & 24h timeline
-    if primary_train_df is not None and primary_y is not None and primary_weights is not None:
-        schedule_model = fit_calibrated_hgb(primary_train_df[schedule_cols], primary_y, primary_weights, max_depth=5)
+    # --- Pure Schedule Model (Unshifted target so timestamps align with actual state!) ---
+    sched_y = base_df["current_state_bin"].astype(int)
+    if sched_y.nunique() >= 2 and len(base_df) >= 20:
+        sched_age_days = (now_dt - base_df["timestamp"]).dt.total_seconds() / 86400.0
+        sched_weights = np.exp(-np.log(2) * sched_age_days / DECAY_HALF_LIFE_DAYS)
+
+        schedule_model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=8,
+            min_samples_leaf=3,
+            random_state=42,
+        )
+        schedule_model.fit(base_df[schedule_cols], sched_y, sample_weight=sched_weights)
         next_on, next_off, timeline_24h = estimate_next_transitions(
             schedule_model, now_dt, curr_bin, holiday_dates, workday_item
         )
